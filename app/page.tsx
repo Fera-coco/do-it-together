@@ -15,6 +15,7 @@ type Proof = {
   note: string | null
   link: string | null
   file_path: string | null
+  rejection_reason: string | null
   created_at?: string
   profiles: { display_name: string } | null
   daily_tasks: { platform: string; points: number } | null
@@ -393,13 +394,13 @@ export default function Home() {
       // and reviewed_by), so a bare "profiles(display_name)" is an ambiguous embed that
       // PostgREST rejects with HTTP 300 — which supabase-js surfaces as {data: null, error},
       // silently emptying this list and reverting a just-submitted proof back to "Submit proof".
-      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,profiles!user_id(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).eq('task_date', cdate),
+      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,rejection_reason,profiles!user_id(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).eq('task_date', cdate),
       db.from('room_day_state').select('cycle_date,combined_points,grade').eq('room_id', roomRow.id).order('cycle_date', { ascending: false }).limit(HISTORY_DAYS),
       db.from('member_week_state').select('user_id,rest_credits_remaining,rest_days').eq('room_id', roomRow.id).eq('week_start', weekStart),
       db.from('room_messages').select('id,user_id,body,created_at').eq('room_id', roomRow.id).order('created_at', { ascending: true }).limit(100),
       db.from('daily_tasks').select('id,user_id,cycle_date,platform').eq('room_id', roomRow.id).gte('cycle_date', since),
       db.from('proofs').select('task_id').eq('room_id', roomRow.id).eq('status', 'approved').gte('task_date', since),
-      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,created_at,profiles!user_id(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(30),
+      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,rejection_reason,created_at,profiles!user_id(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(30),
       db.from('profile_platforms').select('platform').eq('user_id', myId),
       amOwner
         ? db.from('room_invites').select('code,uses,max_uses').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(1).maybeSingle()
@@ -676,7 +677,7 @@ export default function Home() {
       // background reload happens to land.
       setProofs(prev => [
         ...prev.filter(p => p.id !== data.id),
-        { id: data.id, task_id: task.id, user_id: user.id, status: 'submitted', kind, note, link, file_path: filePath,
+        { id: data.id, task_id: task.id, user_id: user.id, status: 'submitted', kind, note, link, file_path: filePath, rejection_reason: null,
           profiles: { display_name: myName }, daily_tasks: { platform: task.platform, points: task.points } },
       ])
       setNotice('Proof sent.')
@@ -703,7 +704,7 @@ export default function Home() {
     const reason = String(new FormData(e.currentTarget).get('reason') || '').trim() || null
     const { error } = await db.rpc('review_proof', { proof_id: rejectingProof.id, decision: 'rejected', reason })
     if (error) setNotice(error.message)
-    else { setNotice('Proof rejected.'); setRejectingProof(null); await loadDashboard(room) }
+    else { setNotice('Reupload requested.'); setRejectingProof(null); await loadDashboard(room) }
   }
 
   async function sendMessage(e: FormEvent<HTMLFormElement>) {
@@ -897,14 +898,14 @@ export default function Home() {
                     </div>
                     {rejectingProof?.id === p.id ? (
                       <form className="rejectForm" onSubmit={confirmReject}>
-                        <input name="reason" placeholder="Why? (optional)" autoFocus />
-                        <button>Confirm reject</button>
+                        <input name="reason" placeholder="What needs fixing? (they'll see this)" autoFocus />
+                        <button>Send request</button>
                         <button className="link" type="button" onClick={() => setRejectingProof(null)}>Cancel</button>
                       </form>
                     ) : (
                       <>
                         <button onClick={() => approveProof(p)}>Confirm</button>
-                        <button className="reject" onClick={() => setRejectingProof(p)}>Reject</button>
+                        <button className="reject" onClick={() => setRejectingProof(p)}>Ask for reupload</button>
                       </>
                     )}
                   </div>
@@ -921,10 +922,16 @@ export default function Home() {
                   return (
                     <article className="task taskV2" key={task.id}>
                       <span className={`checkDot ${proof?.status === 'approved' ? 'done' : ''}`}>{proof?.status === 'approved' ? '✓' : ''}</span>
-                      <div><b>{task.platform}</b><small>Post on {task.platform} today · {task.points} points</small></div>
-                      {proof
-                        ? <span className={`proof ${proof.status}`}>{proof.status === 'approved' ? 'Confirmed ✓' : proof.status === 'rejected' ? 'Rejected — resubmit' : 'Waiting for partner'}</span>
-                        : <button onClick={() => setProofModalTask(task)}>Submit proof →</button>}
+                      <div>
+                        <b>{task.platform}</b>
+                        <small>Post on {task.platform} today · {task.points} points</small>
+                        {proof?.status === 'rejected' && <em>Partner asked for a reupload{proof.rejection_reason ? `: ${proof.rejection_reason}` : ''}</em>}
+                      </div>
+                      {!proof
+                        ? <button onClick={() => setProofModalTask(task)}>Submit proof →</button>
+                        : proof.status === 'rejected'
+                          ? <button onClick={() => setProofModalTask(task)}>Resubmit →</button>
+                          : <span className={`proof ${proof.status}`}>{proof.status === 'approved' ? 'Confirmed ✓' : 'Waiting for partner'}</span>}
                     </article>
                   )
                 })}
