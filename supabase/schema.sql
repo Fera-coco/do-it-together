@@ -104,13 +104,26 @@ create table public.room_day_state (
 -- Each member starts a week (Monday-anchored, independent of the room's own day boundary) with
 -- 2 rest credits. A credit is spent either by legitimately resting on a chosen rest weekday, or
 -- as a penalty when settle_past_days() finds a required posting day with zero approved proof.
+-- rest_days is picked fresh each week (set_week_rest_days) rather than inherited permanently from
+-- room_members.rest_days, which now only serves as a pre-fill default for the next week's picker.
+-- NULL means "hasn't picked yet this week" — get_today_status() treats that as no rest day today.
 create table public.member_week_state (
   room_id uuid not null references public.rooms(id) on delete cascade,
   user_id uuid not null references public.profiles(id) on delete cascade,
   week_start date not null,
   rest_credits_remaining smallint not null default 2 check (rest_credits_remaining between 0 and 2),
+  rest_days smallint[] check (rest_days is null or (cardinality(rest_days) <= 2 and rest_days <@ array[0,1,2,3,4,5,6]::smallint[])),
   primary key (room_id, user_id, week_start)
 );
+
+create table public.room_messages (
+  id uuid primary key default gen_random_uuid(),
+  room_id uuid not null references public.rooms(id) on delete cascade,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  body text not null check (char_length(body) between 1 and 500),
+  created_at timestamptz not null default now()
+);
+create index room_messages_room_created_idx on public.room_messages(room_id, created_at);
 
 alter table public.profiles enable row level security;
 alter table public.rooms enable row level security;
@@ -121,6 +134,8 @@ alter table public.daily_tasks enable row level security;
 alter table public.proofs enable row level security;
 alter table public.room_day_state enable row level security;
 alter table public.member_week_state enable row level security;
+alter table public.room_messages enable row level security;
+alter publication supabase_realtime add table public.room_messages;
 
 -- A SELECT policy on room_members that queries room_members from within its own USING clause
 -- causes Postgres to report "infinite recursion detected in policy for relation room_members".
@@ -176,8 +191,13 @@ create policy "members see room day state" on public.room_day_state for select t
 -- No write policy: only settle_past_days() writes this table.
 
 create policy "members see week state" on public.member_week_state for select to authenticated using (exists (select 1 from public.room_members m where m.room_id = member_week_state.room_id and m.user_id = (select auth.uid())));
--- No write policy: only get_today_status()/settle_past_days() write this table. Visible to every
--- room member (not just its owner) so partners can see each other's remaining rest credits.
+-- No write policy: only get_today_status()/settle_past_days()/set_week_rest_days() write this
+-- table. Visible to every room member (not just its owner) so partners can see each other's
+-- remaining rest credits.
+
+create policy "members see room messages" on public.room_messages for select to authenticated using (exists (select 1 from public.room_members m where m.room_id = room_messages.room_id and m.user_id = (select auth.uid())));
+create policy "members send room messages" on public.room_messages for insert to authenticated with check ((select auth.uid()) = user_id and exists (select 1 from public.room_members m where m.room_id = room_messages.room_id and m.user_id = (select auth.uid())));
+-- No update/delete policy: messages are immutable for v1, no editing or deleting.
 
 -- Given a room and an instant, returns the "cycle_date" that instant belongs to: the calendar
 -- date (in the room's own timezone) of the most recent day_boundary_time at or before that
@@ -243,6 +263,28 @@ begin
 end; $$;
 revoke all on function public.set_member_rest_days(uuid,smallint[]) from public;
 grant execute on function public.set_member_rest_days(uuid,smallint[]) to authenticated;
+
+-- Picks this member's rest days for the CURRENT week (the one get_today_status would compute
+-- right now). Also updates room_members.rest_days so next week's picker has a sensible default
+-- to pre-fill from, but that column is otherwise no longer authoritative for enforcement.
+create or replace function public.set_week_rest_days(target_room uuid, days smallint[])
+returns void language plpgsql security definer set search_path = '' as $$
+declare cdate date; wk_start date;
+begin
+  if auth.uid() is null then raise exception 'Not signed in'; end if;
+  if days is not null and cardinality(days) > 2 then raise exception 'Pick at most 2 rest days'; end if;
+  if not exists (select 1 from public.room_members where room_id = target_room and user_id = auth.uid()) then
+    raise exception 'Not a member of this room';
+  end if;
+  cdate := public.room_cycle_date(target_room);
+  wk_start := cdate - (((extract(dow from cdate)::int + 6) % 7));
+  insert into public.member_week_state(room_id,user_id,week_start,rest_credits_remaining,rest_days)
+    values (target_room, auth.uid(), wk_start, 2, coalesce(days,'{}'))
+    on conflict (room_id,user_id,week_start) do update set rest_days = excluded.rest_days;
+  update public.room_members set rest_days = coalesce(days,'{}') where room_id = target_room and user_id = auth.uid();
+end; $$;
+revoke all on function public.set_week_rest_days(uuid,smallint[]) from public;
+grant execute on function public.set_week_rest_days(uuid,smallint[]) to authenticated;
 
 -- Grades and closes out every past (cycle_date < today), not-yet-settled day for a room: sums
 -- each day's approved points across all members into combined_points, assigns a grade label,
@@ -313,11 +355,12 @@ begin
     values (target_room, auth.uid(), wk_start, 2)
     on conflict (room_id,user_id,week_start) do nothing;
 
-  select rest_days into member_rest_days from public.room_members where room_id = target_room and user_id = auth.uid();
+  -- Rest days are picked fresh per week via set_week_rest_days(); NULL here means the member
+  -- hasn't picked yet this week, which the client prompts for and which counts as no rest day.
+  select rest_credits_remaining, rest_days into credits, member_rest_days
+    from public.member_week_state where room_id = target_room and user_id = auth.uid() and week_start = wk_start;
 
   if not exists (select 1 from public.daily_tasks where room_id = target_room and user_id = auth.uid() and cycle_date = cdate) then
-    select rest_credits_remaining into credits from public.member_week_state where room_id = target_room and user_id = auth.uid() and week_start = wk_start;
-
     if member_rest_days is not null and today_dow = any(member_rest_days) and coalesce(credits,0) > 0 then
       insert into public.daily_tasks(room_id,user_id,cycle_date,platform,points) values (target_room, auth.uid(), cdate, '__rest__', 0);
       update public.member_week_state set rest_credits_remaining = rest_credits_remaining - 1
@@ -370,6 +413,21 @@ begin
 end; $$;
 revoke all on function public.review_proof(uuid,public.proof_status,text) from public;
 grant execute on function public.review_proof(uuid,public.proof_status,text) to authenticated;
+
+-- A solo room (exactly one member) has nobody who could ever pass review_proof()'s "not your own
+-- proof" check, so proof would sit at 'submitted' forever. This trigger auto-approves it instead,
+-- based on the room's actual membership count at insert time (never client-controlled), so a
+-- 2-person room can't be tricked into self-approval by claiming solo client-side.
+create or replace function public.auto_approve_solo_proof() returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  if (select count(*) from public.room_members where room_id = new.room_id) = 1 then
+    update public.proofs set status = 'approved', reviewed_by = new.user_id, reviewed_at = now()
+      where id = new.id and status = 'submitted';
+  end if;
+  return new;
+end; $$;
+revoke all on function public.auto_approve_solo_proof() from public;
+create trigger proofs_auto_approve_solo after insert on public.proofs for each row execute function public.auto_approve_solo_proof();
 
 create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path = '' as $$
 begin insert into public.profiles(id,display_name) values(new.id,coalesce(new.raw_user_meta_data->>'display_name','New friend')); return new; end; $$;
