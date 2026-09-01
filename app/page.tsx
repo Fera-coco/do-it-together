@@ -23,8 +23,8 @@ type DayState = { cycle_date: string; combined_points: number; grade: string }
 type WeekState = { user_id: string; rest_credits_remaining: number; rest_days: number[] | null }
 type ChatMessage = { id: string; user_id: string; body: string; created_at: string }
 type HistTask = { id: string; user_id: string; cycle_date: string; platform: string }
-type Mode = 'auth' | 'platforms' | 'profile' | 'setup' | 'join' | 'room'
-type DashTab = 'today' | 'calendar' | 'feed' | 'progress'
+type Mode = 'loading' | 'auth' | 'platforms' | 'profile' | 'setup' | 'join' | 'room'
+type DashTab = 'today' | 'calendar' | 'feed' | 'chat' | 'progress'
 
 const PLATFORM_OPTIONS = ['Instagram', 'TikTok', 'YouTube', 'X (Twitter)', 'LinkedIn', 'Threads', 'Facebook', 'Pinterest', 'Snapchat', 'Other']
 const WEEKDAYS = [{ v: 0, l: 'Sun' }, { v: 1, l: 'Mon' }, { v: 2, l: 'Tue' }, { v: 3, l: 'Wed' }, { v: 4, l: 'Thu' }, { v: 5, l: 'Fri' }, { v: 6, l: 'Sat' }]
@@ -32,6 +32,14 @@ const BOUNDARY_PRESETS = [{ v: '00:00', l: 'Midnight → Midnight' }, { v: '06:0
 const AVATAR_COLORS = ['#e2a23f', '#e28aa5', '#8f7fd6', '#6fb98f', '#e2946b', '#7fa8d6']
 const ACTIVE_ROOM_KEY = 'dit_active_room'
 const HISTORY_DAYS = 35
+const REMINDER_THRESHOLDS = [7200, 3600, 900]
+const NAV_TABS: { id: DashTab; icon: string; label: string }[] = [
+  { id: 'today', icon: '◉', label: 'Today' },
+  { id: 'calendar', icon: '▦', label: 'Calendar' },
+  { id: 'feed', icon: '◌', label: 'Feed' },
+  { id: 'chat', icon: '◐', label: 'Chat' },
+  { id: 'progress', icon: '↗', label: 'Progress' },
+]
 
 function gradeLabel(points: number) {
   if (points >= 100) return 'Lovely'
@@ -136,7 +144,7 @@ export default function Home() {
   const [isRestDay, setIsRestDay] = useState(false)
   const [inviteCode, setInviteCode] = useState('')
   const [notice, setNotice] = useState('')
-  const [mode, setMode] = useState<Mode>('auth')
+  const [mode, setMode] = useState<Mode>('loading')
   const [dashTab, setDashTab] = useState<DashTab>('today')
   const [cameFromRoom, setCameFromRoom] = useState(false)
   const [authView, setAuthView] = useState<'signup' | 'signin'>('signup')
@@ -148,14 +156,22 @@ export default function Home() {
   const [proofModalTask, setProofModalTask] = useState<DailyTask | null>(null)
   const [proofFile, setProofFile] = useState<File | null>(null)
   const [rejectingProof, setRejectingProof] = useState<Proof | null>(null)
-  const [, setTick] = useState(0)
+  const [notifPermission, setNotifPermission] = useState<'default' | 'granted' | 'denied' | 'unsupported'>('unsupported')
+  const [tick, setTick] = useState(0)
   const chatEndRef = useRef<HTMLDivElement>(null)
+  const notifiedRef = useRef<Record<string, boolean>>({})
+
+  useEffect(() => {
+    if (typeof Notification === 'undefined') return
+    setNotifPermission(Notification.permission)
+  }, [])
 
   useEffect(() => {
     if (!db) return
     db.auth.getUser().then(({ data }) => {
       setUser(data.user)
       if (data.user) checkUserState()
+      else setMode('auth')
     })
     const { data: { subscription } } = db.auth.onAuthStateChange((_e, s) => {
       setUser(s?.user ?? null)
@@ -170,11 +186,43 @@ export default function Home() {
     return () => clearInterval(id)
   }, [])
 
+  // Reminders fire while this tab (or installed app) is open, at most once per threshold per
+  // cycle_date. True background push (notifications even when the app is fully closed) needs a
+  // service worker + a push-subscription store + something to trigger sends on a schedule —
+  // real new infrastructure this doesn't attempt yet.
+  useEffect(() => {
+    if (notifPermission !== 'granted' || !room || !cycleDate) return
+    const secs = Math.max(0, Math.floor((nextBoundary(room.day_boundary_time).getTime() - Date.now()) / 1000))
+    const myId = user?.id
+    const incomplete = tasks.some(t => !proofs.find(p => p.task_id === t.id && p.user_id === myId && p.status !== 'rejected'))
+    if (!incomplete) return
+    for (const th of REMINDER_THRESHOLDS) {
+      const key = `${room.id}-${cycleDate}-${th}`
+      if (secs <= th && !notifiedRef.current[key]) {
+        notifiedRef.current[key] = true
+        try { new Notification('Do It Together', { body: `${Math.round(th / 60)} minutes left to post today.`, icon: '/icon.svg' }) } catch { /* unsupported in this context */ }
+      }
+    }
+  }, [tick, notifPermission, room, cycleDate, tasks, proofs, user])
+
   useEffect(() => {
     if (!db || !room) return
     const channel = db.channel(`room-messages-${room.id}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'room_messages', filter: `room_id=eq.${room.id}` }, (payload: any) => {
         setMessages(prev => (prev.some(m => m.id === payload.new.id) ? prev : [...prev, payload.new as ChatMessage]))
+      })
+      .subscribe()
+    return () => { db.removeChannel(channel) }
+  }, [db, room?.id])
+
+  // Any proof change in the room (new submission, a review, a resubmit) reloads the dashboard,
+  // so a partner sees a fresh photo/link/note — and its review status — without a manual refresh.
+  useEffect(() => {
+    if (!db || !room) return
+    const roomForReload = room
+    const channel = db.channel(`room-proofs-${room.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'proofs', filter: `room_id=eq.${room.id}` }, () => {
+        loadDashboard(roomForReload)
       })
       .subscribe()
     return () => { db.removeChannel(channel) }
@@ -276,6 +324,13 @@ export default function Home() {
       return [p.id, data?.signedUrl || ''] as const
     }))
     setSignedUrls(prev => ({ ...prev, ...Object.fromEntries(entries) }))
+  }
+
+  async function enableReminders() {
+    if (typeof Notification === 'undefined') { setNotice('Notifications are not supported on this device or browser.'); return }
+    const perm = await Notification.requestPermission()
+    setNotifPermission(perm)
+    setNotice(perm === 'granted' ? 'Reminders on — we\'ll nudge you as the clock runs down.' : 'Notifications permission was not granted.')
   }
 
   async function auth(e: FormEvent<HTMLFormElement>) {
@@ -430,13 +485,15 @@ export default function Home() {
     return done === memberTasks.length ? 'Done for today' : `${done} of ${memberTasks.length} done`
   }
 
+  if (mode === 'loading') return <main className="splash"><b className="brand">↗ <span>do it<br />together</span></b><span className="splashPulse" /></main>
+
   if (!db) return <main className="welcome"><div><p className="eyebrow">DO IT TOGETHER</p><h1>Almost<br/><i>ready.</i></h1><p>Add the Supabase public URL and publishable key in <code>.env.local</code> to start your private room.</p></div></main>
 
   if (mode === 'auth') return <main className="welcome"><div><p className="eyebrow">DO IT TOGETHER</p><h1>Show up.<br/><i>Together.</i></h1><p>Build your own social rhythm, then invite a friend whenever you want accountability.</p></div><form className="card" onSubmit={auth}><h2>{authView === 'signup' ? 'Create your profile' : 'Welcome back'}</h2>{authView === 'signup' && <input required name="name" placeholder="Your name" />}<input required name="email" type="email" placeholder="Email" /><input required name="password" type="password" placeholder="Password" minLength={6} /><button>{authView === 'signup' ? 'Create profile →' : 'Sign in →'}</button><button className="link" type="button" onClick={() => { setAuthView(authView === 'signup' ? 'signin' : 'signup'); setNotice('') }}>{authView === 'signup' ? 'I already have an account' : 'Create a new account'}</button>{notice && <small>{notice}</small>}</form></main>
 
   if (mode === 'platforms') return <main className="welcome"><div><p className="eyebrow">PICK YOUR PLATFORMS</p><h1>Where do you<br/><i>want to grow?</i></h1><p>Pick at least 3. Every posting day we'll randomly choose 3 of these for you, worth 50 points split unevenly — keeps it interesting.</p></div><form className="card setup" onSubmit={savePlatforms}><div className="chipGrid">{PLATFORM_OPTIONS.map(p => <button type="button" key={p} className={selectedPlatforms.includes(p) ? 'picked' : ''} onClick={() => togglePlatform(p)}>{p}</button>)}</div><button disabled={selectedPlatforms.length < 3}>Continue → ({selectedPlatforms.length}/3)</button>{notice && <small>{notice}</small>}</form></main>
 
-  if (mode === 'profile') return <main className="welcome"><form className="card setup"><p className="eyebrow">{cameFromRoom ? 'ADD A ROOM' : 'YOUR PROFILE IS READY'}</p><h1>How do you want<br/><i>to show up?</i></h1><p>Start alone now, create a shared room for a friend, or join a friend who has already created one.</p><div className="picks"><button type="button" onClick={() => setMode('setup')}><b>Use it solo</b><span>Your own daily posting goals</span></button><button type="button" onClick={() => setMode('setup')}><b>Create a room with a friend</b><span>Make an invite code after setup</span></button><button type="button" onClick={() => setMode('join')}><b>Join a friend</b><span>Enter their room code</span></button></div>{cameFromRoom && <button className="link" type="button" onClick={() => setMode('room')}>Back to dashboard</button>}</form></main>
+  if (mode === 'profile') return <main className="welcome"><form className="card setup"><p className="eyebrow">{cameFromRoom ? 'ADD A ROOM' : 'YOUR PROFILE IS READY'}</p><h1>How do you want<br/><i>to show up?</i></h1><p>Start alone now, create a shared room for a friend, or join a friend who has already created one. Rooms are capped at 2 people.</p><div className="picks"><button type="button" onClick={() => setMode('setup')}><b>Use it solo</b><span>Your own daily posting goals</span></button><button type="button" onClick={() => setMode('setup')}><b>Create a room with a friend</b><span>Make an invite code after setup</span></button><button type="button" onClick={() => setMode('join')}><b>Join a friend</b><span>Enter their room code</span></button></div>{cameFromRoom && <button className="link" type="button" onClick={() => setMode('room')}>Back to dashboard</button>}</form></main>
 
   if (mode === 'join') return <main className="welcome"><form className="card setup" onSubmit={joinRoom}><p className="eyebrow">JOIN A ROOM</p><h1>Bring your<br/><i>friend's code.</i></h1><input required name="code" placeholder="Invite code" /><label>Your rest days (pick up to 2)</label><WeekdayPicker selected={joinRestDays} onToggle={toggleJoinRestDay} /><button>Join room →</button><button className="link" type="button" onClick={() => setMode(myRooms.length ? 'room' : 'profile')}>Back</button>{notice && <small>{notice}</small>}</form></main>
 
@@ -457,22 +514,26 @@ export default function Home() {
   const myStreak = streaks[myId || ''] || { current: 0, best: 0 }
   const last7 = dayStates.slice(-7)
   const calendarDays = Array.from({ length: HISTORY_DAYS }, (_, i) => daysAgoDate(HISTORY_DAYS - 1 - i))
+  const roomFull = members.length >= 2
 
   return (
     <main className="dashboardV2">
       <aside className="sidebar">
-        <b className="brand">↗ <span>do it<br />together</span></b>
+        <div className="sidebarTop">
+          <b className="brand">↗ <span>do it<br />together</span></b>
+          <button className="link sidebarSignout" onClick={() => db.auth.signOut()}>Sign out</button>
+        </div>
         <nav>
-          <button className={dashTab === 'today' ? 'active' : ''} onClick={() => setDashTab('today')}>◉ Today</button>
-          <button className={dashTab === 'calendar' ? 'active' : ''} onClick={() => setDashTab('calendar')}>▦ Calendar</button>
-          <button className={dashTab === 'feed' ? 'active' : ''} onClick={() => setDashTab('feed')}>◌ Group feed</button>
-          <button className={dashTab === 'progress' ? 'active' : ''} onClick={() => setDashTab('progress')}>↗ Your progress</button>
+          {NAV_TABS.map(t => (
+            <button key={t.id} className={dashTab === t.id ? 'active' : ''} onClick={() => setDashTab(t.id)}>
+              <span className="navIcon">{t.icon}</span><span className="navLabel">{t.label}</span>
+            </button>
+          ))}
         </nav>
         <div className="sidebarRooms">
           {myRooms.map(r => <button key={r.id} className={r.id === room?.id ? 'active' : ''} onClick={() => switchRoom(r)}>{r.name}</button>)}
           <button className="addRoom" onClick={() => { setCameFromRoom(true); setMode('profile') }}>+ Add room</button>
         </div>
-        <button className="link sidebarSignout" onClick={() => db.auth.signOut()}>Sign out</button>
       </aside>
 
       <section className="mainPane">
@@ -504,8 +565,8 @@ export default function Home() {
           <>
             <section className="hero heroV2">
               <p className="eyebrow">{room?.name}</p>
-              <h1>Show up for<br /><i>yourself.</i></h1>
-              <p>The room needs at least 50 combined before the cycle resets, or today's points are at risk.</p>
+              <h1>Stay above<br /><i>50 points.</i></h1>
+              <p>That's the floor the room needs combined for today to count safely. Push to {target} for a Lovely day.</p>
             </section>
 
             <section className="statRow">
@@ -526,7 +587,11 @@ export default function Home() {
               <small>TODAY CLOSES IN</small>
               <strong>{time}</strong>
               <span>Resets at {room ? formatBoundary(room.day_boundary_time) : ''} ({room?.timezone}). Submit your proof before then.</span>
-              {isOwner && <button className="tinyLink" type="button" onClick={() => setShowSettings(s => !s)}>Adjust clock</button>}
+              <div className="countCardActions">
+                {isOwner && <button className="tinyLink" type="button" onClick={() => setShowSettings(s => !s)}>Adjust clock</button>}
+                {notifPermission !== 'unsupported' && notifPermission !== 'granted' && <button className="tinyLink" type="button" onClick={enableReminders}>🔔 Get reminders</button>}
+                {notifPermission === 'granted' && <span className="tinyLink" style={{ cursor: 'default' }}>🔔 Reminders on</span>}
+              </div>
             </section>
 
             {showSettings && room && (
@@ -539,8 +604,8 @@ export default function Home() {
             )}
 
             <section className="progress">
-              <b>{confirmed}/{target} confirmed points · {gradeLabel(confirmed)}</b>
-              <span>{confirmed >= 50 ? 'Floor cleared — keep going for a better grade.' : 'No points count until your partner approves proof.'}</span>
+              <b>{confirmed}/{target} points · {gradeLabel(confirmed)}</b>
+              <span>{confirmed >= 50 ? (target - confirmed > 0 ? `Safe for today — ${target - confirmed} more for a perfect day.` : 'Perfect day — Lovely!') : `${50 - confirmed} more combined to clear today's floor.`}</span>
             </section>
 
             {pendingReview.length > 0 && (
@@ -594,7 +659,9 @@ export default function Home() {
             {isOwner && (
               <section className="invitePanel">
                 <small>INVITE A PARTNER</small>
-                {inviteCode ? (
+                {roomFull ? (
+                  <p>Room full — 2 of 2 members. Do It Together rooms are pairs, one accountability partner at a time.</p>
+                ) : inviteCode ? (
                   <>
                     <strong>{inviteCode}</strong>
                     <p>Share this code — they create their own profile, pick their platforms, then choose "Join a friend."</p>
@@ -630,46 +697,44 @@ export default function Home() {
         )}
 
         {dashTab === 'feed' && (
-          <>
-            <section>
-              <p className="eyebrow">FROM THE GROUP</p>
-              <h2>Recent proof</h2>
-              {feedProofs.length === 0 && <p className="dim">Nothing submitted yet.</p>}
-              {feedProofs.map(p => (
-                <article className="feedItem" key={p.id}>
-                  <span className="avatar" style={{ background: avatarColor(p.user_id) }}>{(p.profiles?.display_name || nameFor(p.user_id))[0]?.toUpperCase()}</span>
-                  <div>
-                    <b>{p.profiles?.display_name || nameFor(p.user_id)} · {p.daily_tasks?.platform}</b>
-                    <small>
-                      {p.kind === 'image' ? (signedUrls[p.id] ? <a href={signedUrls[p.id]} target="_blank" rel="noreferrer">View photo →</a> : 'Loading photo…') : p.kind === 'link' ? p.link : p.note}
-                    </small>
-                    <span className={`proof ${p.status}`}>{p.status === 'approved' ? 'Confirmed ✓' : p.status === 'rejected' ? 'Rejected' : 'Awaiting review'}</span>
-                  </div>
-                </article>
-              ))}
-            </section>
-
-            {members.length > 1 && (
-              <section className="chatSection">
-                <p className="eyebrow">ROOM CHAT</p>
-                <h2>Check in with your partner</h2>
-                <div className="chatLog">
-                  {messages.length === 0 && <p className="dim">No messages yet — say hi.</p>}
-                  {messages.map(m => (
-                    <div key={m.id} className={`chatBubble ${m.user_id === myId ? 'mine' : ''}`}>
-                      <small>{nameFor(m.user_id)} · {formatTime(m.created_at)}</small>
-                      <p>{m.body}</p>
-                    </div>
-                  ))}
-                  <div ref={chatEndRef} />
+          <section>
+            <p className="eyebrow">FROM THE GROUP</p>
+            <h2>Recent proof</h2>
+            {feedProofs.length === 0 && <p className="dim">Nothing submitted yet.</p>}
+            {feedProofs.map(p => (
+              <article className="feedItem" key={p.id}>
+                <span className="avatar" style={{ background: avatarColor(p.user_id) }}>{(p.profiles?.display_name || nameFor(p.user_id))[0]?.toUpperCase()}</span>
+                <div>
+                  <b>{p.profiles?.display_name || nameFor(p.user_id)} · {p.daily_tasks?.platform}</b>
+                  <small>
+                    {p.kind === 'image' ? (signedUrls[p.id] ? <a href={signedUrls[p.id]} target="_blank" rel="noreferrer">View photo →</a> : 'Loading photo…') : p.kind === 'link' ? p.link : p.note}
+                  </small>
+                  <span className={`proof ${p.status}`}>{p.status === 'approved' ? 'Confirmed ✓' : p.status === 'rejected' ? 'Rejected' : 'Awaiting review'}</span>
                 </div>
-                <form className="chatForm" onSubmit={sendMessage}>
-                  <input value={chatText} onChange={e => setChatText(e.target.value)} placeholder="Message your partner…" maxLength={500} />
-                  <button>Send</button>
-                </form>
-              </section>
-            )}
-          </>
+              </article>
+            ))}
+          </section>
+        )}
+
+        {dashTab === 'chat' && (
+          <section className="chatSection">
+            <p className="eyebrow">ROOM CHAT</p>
+            <h2>Check in with your partner</h2>
+            <div className="chatLog">
+              {messages.length === 0 && <p className="dim">No messages yet — say hi.</p>}
+              {messages.map(m => (
+                <div key={m.id} className={`chatBubble ${m.user_id === myId ? 'mine' : ''}`}>
+                  <small>{nameFor(m.user_id)} · {formatTime(m.created_at)}</small>
+                  <p>{m.body}</p>
+                </div>
+              ))}
+              <div ref={chatEndRef} />
+            </div>
+            <form className="chatForm" onSubmit={sendMessage}>
+              <input value={chatText} onChange={e => setChatText(e.target.value)} placeholder="Message your partner…" maxLength={500} />
+              <button>Send</button>
+            </form>
+          </section>
         )}
 
         {dashTab === 'progress' && (
@@ -712,7 +777,8 @@ export default function Home() {
               <span className="streakNum">{streaks[m.user_id]?.current ?? 0}<small>days</small></span>
             </div>
           ))}
-          {isOwner && <button className="inviteRow" type="button" onClick={() => setDashTab('today')}>+ Invite a friend</button>}
+          {isOwner && !roomFull && <button className="inviteRow" type="button" onClick={() => setDashTab('today')}>+ Invite a friend</button>}
+          {roomFull && <p className="dim" style={{ marginTop: 8 }}>Room full (2/2)</p>}
         </div>
 
         <div className="feedPanel card">

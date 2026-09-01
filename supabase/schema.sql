@@ -136,6 +136,7 @@ alter table public.room_day_state enable row level security;
 alter table public.member_week_state enable row level security;
 alter table public.room_messages enable row level security;
 alter publication supabase_realtime add table public.room_messages;
+alter publication supabase_realtime add table public.proofs;
 
 -- A SELECT policy on room_members that queries room_members from within its own USING clause
 -- causes Postgres to report "infinite recursion detected in policy for relation room_members".
@@ -234,6 +235,12 @@ begin
   if joiner_rest_days is not null and cardinality(joiner_rest_days) > 2 then raise exception 'Pick at most 2 rest days'; end if;
   select room_id into target_room from public.room_invites where code = upper(invite_code) and uses < max_uses and (expires_at is null or expires_at > now()) for update;
   if target_room is null then raise exception 'This invite is invalid or expired'; end if;
+  if exists (select 1 from public.room_members where room_id = target_room and user_id = auth.uid()) then
+    return target_room;
+  end if;
+  if (select count(*) from public.room_members where room_id = target_room) >= 2 then
+    raise exception 'This room already has 2 members';
+  end if;
   insert into public.room_members(room_id,user_id,rest_days) values(target_room,auth.uid(),coalesce(joiner_rest_days,'{}')) on conflict do nothing;
   update public.room_invites set uses = uses + 1 where room_id = target_room and code = upper(invite_code);
   return target_room;
