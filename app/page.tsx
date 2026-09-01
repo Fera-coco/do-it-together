@@ -476,11 +476,15 @@ export default function Home() {
     if (!db || !room) return
     e.preventDefault()
     const form = new FormData(e.currentTarget)
+    const name = String(form.get('roomName') || '').trim()
     const boundary = String(form.get('boundary'))
     const timezone = String(form.get('timezone'))
-    const { error } = await db.from('rooms').update({ day_boundary_time: boundary, timezone }).eq('id', room.id)
+    if (!name) { setNotice("Room name can't be empty."); return }
+    const { error } = await db.from('rooms').update({ name, day_boundary_time: boundary, timezone }).eq('id', room.id)
     if (error) setNotice(error.message)
-    else { setNotice('Room clock updated.'); setShowProfileMenu(false); await loadDashboard({ ...room, day_boundary_time: boundary, timezone }) }
+    // checkUserState (not just loadDashboard) so the sidebar's room switcher picks up a renamed
+    // room too, not just the dashboard currently open on it.
+    else { setNotice('Room settings updated.'); setShowProfileMenu(false); await checkUserState() }
   }
 
   async function leaveRoom() {
@@ -649,6 +653,7 @@ export default function Home() {
   const myStreak = streaks[myId || ''] || { current: 0, best: 0 }
   const last7 = dayStates.slice(-7)
   const calendarDays = Array.from({ length: HISTORY_DAYS }, (_, i) => daysAgoDate(HISTORY_DAYS - 1 - i))
+  const todayReal = daysAgoDate(0)
   const roomFull = members.length >= 2
   const isIOS = typeof navigator !== 'undefined' && /iphone|ipad|ipod/i.test(navigator.userAgent)
   const isAndroid = typeof navigator !== 'undefined' && /android/i.test(navigator.userAgent)
@@ -812,7 +817,12 @@ export default function Home() {
             <div className="calendarGrid">
               {calendarDays.map(d => {
                 const state = dayStates.find(ds => ds.cycle_date === d)
-                const cls = d === cycleDate ? 'pending' : (state ? (state.combined_points >= 50 ? 'done' : 'missed') : 'missed')
+                // The grid's own cells are built from real calendar dates (daysAgoDate), so the
+                // "today" highlight has to match that — not the room's cycleDate, which can
+                // legitimately lag behind the real date for most of the day depending on how
+                // late the room's day-boundary is set (e.g. an 11:59pm boundary means cycleDate
+                // stays "yesterday" until the last minute before midnight).
+                const cls = d === todayReal ? 'pending' : (state ? (state.combined_points >= 50 ? 'done' : 'missed') : 'missed')
                 return (
                   <div key={d} className={`calendarDay ${cls}`}>
                     <small>{new Date(d + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' })}</small>
@@ -958,11 +968,13 @@ export default function Home() {
 
             {room && isOwner && (
               <form onSubmit={saveRoomSettings}>
+                <label>Room name</label>
+                <input name="roomName" defaultValue={room.name} maxLength={60} required />
                 <label>When does your day reset?</label>
                 <select name="boundary" defaultValue={room.day_boundary_time.slice(0, 5)}>{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select>
                 <label>Timezone</label>
                 <select name="timezone" defaultValue={room.timezone}>{TIMEZONE_OPTIONS.map(tz => <option key={tz} value={tz}>{tz}</option>)}</select>
-                <button>Save clock</button>
+                <button>Save room settings</button>
               </form>
             )}
 
