@@ -75,18 +75,35 @@ alter table public.room_tasks enable row level security;
 alter table public.room_invites enable row level security;
 alter table public.proofs enable row level security;
 
+-- A SELECT policy on room_members that queries room_members from within its own USING clause
+-- causes Postgres to report "infinite recursion detected in policy for relation room_members".
+-- Routing the membership check through this SECURITY DEFINER function sidesteps RLS entirely
+-- for that one lookup, so it can safely be reused by both the rooms and room_members policies.
+create or replace function public.is_current_room_member(target_room uuid)
+returns boolean language sql stable security definer set search_path = 'public' as $$
+  select auth.uid() is not null
+    and exists (select 1 from public.room_members where room_id = target_room and user_id = auth.uid());
+$$;
+revoke all on function public.is_current_room_member(uuid) from public;
+grant execute on function public.is_current_room_member(uuid) to authenticated;
+
 create policy "profiles visible to signed-in users" on public.profiles for select to authenticated using (true);
 create policy "users update own profile" on public.profiles for update to authenticated using ((select auth.uid()) = id) with check ((select auth.uid()) = id);
-create policy "members see their rooms" on public.rooms for select to authenticated using (exists (select 1 from public.room_members m where m.room_id = rooms.id and m.user_id = (select auth.uid())));
+create policy "members see their rooms" on public.rooms for select to authenticated using (public.is_current_room_member(id));
 create policy "creator creates a room" on public.rooms for insert to authenticated with check ((select auth.uid()) = created_by);
 create policy "owners update rooms" on public.rooms for update to authenticated using (exists (select 1 from public.room_members m where m.room_id = rooms.id and m.user_id = (select auth.uid()) and m.role = 'owner')) with check (exists (select 1 from public.room_members m where m.room_id = rooms.id and m.user_id = (select auth.uid()) and m.role = 'owner'));
-create policy "members see room members" on public.room_members for select to authenticated using (exists (select 1 from public.room_members me where me.room_id = room_members.room_id and me.user_id = (select auth.uid())));
+create policy "members see room members" on public.room_members for select to authenticated using (public.is_current_room_member(room_id));
 create policy "members see tasks" on public.room_tasks for select to authenticated using (exists (select 1 from public.room_members m where m.room_id = room_tasks.room_id and m.user_id = (select auth.uid())));
 create policy "owners manage tasks" on public.room_tasks for all to authenticated using (exists (select 1 from public.room_members m where m.room_id = room_tasks.room_id and m.user_id = (select auth.uid()) and m.role = 'owner')) with check (exists (select 1 from public.room_members m where m.room_id = room_tasks.room_id and m.user_id = (select auth.uid()) and m.role = 'owner'));
 create policy "members see proofs" on public.proofs for select to authenticated using (exists (select 1 from public.room_members m where m.room_id = proofs.room_id and m.user_id = (select auth.uid())));
 create policy "members submit own proof" on public.proofs for insert to authenticated with check ((select auth.uid()) = user_id and exists (select 1 from public.room_members m where m.room_id = proofs.room_id and m.user_id = (select auth.uid())));
-create policy "submitter updates unreviewed proof" on public.proofs for update to authenticated using ((select auth.uid()) = user_id and status = 'submitted') with check ((select auth.uid()) = user_id);
-create policy "room partner reviews proof" on public.proofs for update to authenticated using (user_id <> (select auth.uid()) and exists (select 1 from public.room_members m where m.room_id = proofs.room_id and m.user_id = (select auth.uid()))) with check (reviewed_by = (select auth.uid()));
+-- Submitter may only touch their own proof while it is unreviewed (submitted) or was rejected
+-- (to resubmit), and every such write must land back in 'submitted' with no review fields set.
+-- This is what closes the self-approval hole: a submitter can never set status to 'approved'
+-- themselves, only a room partner via review_proof() below can.
+create policy "submitter resubmits own proof" on public.proofs for update to authenticated
+  using ((select auth.uid()) = user_id and status in ('submitted','rejected'))
+  with check ((select auth.uid()) = user_id and status = 'submitted' and reviewed_by is null and reviewed_at is null and rejection_reason is null);
 create policy "owners see invites" on public.room_invites for select to authenticated using (exists (select 1 from public.room_members m where m.room_id = room_invites.room_id and m.user_id = (select auth.uid()) and m.role = 'owner'));
 create policy "owners create invites" on public.room_invites for insert to authenticated with check ((select auth.uid()) = created_by and exists (select 1 from public.room_members m where m.room_id = room_invites.room_id and m.user_id = (select auth.uid()) and m.role = 'owner'));
 
@@ -118,6 +135,29 @@ begin
 end; $$;
 revoke all on function public.join_room_with_invite(text) from public;
 grant execute on function public.join_room_with_invite(text) to authenticated;
+
+-- Reviewing a partner's proof always goes through this function rather than a direct table
+-- update, so the reviewer identity, the "not your own proof" rule, and the "already reviewed"
+-- rule are all enforced in one place instead of relying on a client-trusted RLS update policy.
+create or replace function public.review_proof(proof_id uuid, decision public.proof_status, reason text default null)
+returns void language plpgsql security definer set search_path = '' as $$
+declare target public.proofs;
+begin
+  if auth.uid() is null then raise exception 'Not signed in'; end if;
+  if decision not in ('approved','rejected') then raise exception 'Invalid decision'; end if;
+  select * into target from public.proofs where id = proof_id for update;
+  if target is null then raise exception 'Proof not found'; end if;
+  if target.user_id = auth.uid() then raise exception 'You cannot review your own proof'; end if;
+  if target.status <> 'submitted' then raise exception 'Proof already reviewed'; end if;
+  if not exists (select 1 from public.room_members m where m.room_id = target.room_id and m.user_id = auth.uid()) then
+    raise exception 'Not a member of this room';
+  end if;
+  update public.proofs set status = decision, reviewed_by = auth.uid(), reviewed_at = now(),
+    rejection_reason = case when decision = 'rejected' then reason else null end
+    where id = proof_id;
+end; $$;
+revoke all on function public.review_proof(uuid,public.proof_status,text) from public;
+grant execute on function public.review_proof(uuid,public.proof_status,text) to authenticated;
 
 create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path = '' as $$
 begin insert into public.profiles(id,display_name) values(new.id,coalesce(new.raw_user_meta_data->>'display_name','New friend')); return new; end; $$;
