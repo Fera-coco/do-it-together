@@ -30,6 +30,10 @@ const PLATFORM_OPTIONS = ['Instagram', 'TikTok', 'YouTube', 'X (Twitter)', 'Link
 const WEEKDAYS = [{ v: 0, l: 'Sun' }, { v: 1, l: 'Mon' }, { v: 2, l: 'Tue' }, { v: 3, l: 'Wed' }, { v: 4, l: 'Thu' }, { v: 5, l: 'Fri' }, { v: 6, l: 'Sat' }]
 const BOUNDARY_PRESETS = [{ v: '00:00', l: 'Midnight → Midnight' }, { v: '06:00', l: '6am → 6am' }, { v: '12:00', l: 'Noon → Noon' }, { v: '18:00', l: '6pm → 6pm' }]
 const AVATAR_COLORS = ['#e2a23f', '#e28aa5', '#8f7fd6', '#6fb98f', '#e2946b', '#7fa8d6']
+const TIMEZONE_OPTIONS: string[] = (() => {
+  try { return (Intl as any).supportedValuesOf('timeZone') }
+  catch { return ['UTC', 'America/Los_Angeles', 'America/Denver', 'America/Chicago', 'America/New_York', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Africa/Lagos', 'Africa/Nairobi', 'Asia/Dubai', 'Asia/Kolkata', 'Asia/Singapore', 'Asia/Tokyo', 'Australia/Sydney'] }
+})()
 const ACTIVE_ROOM_KEY = 'dit_active_room'
 const HISTORY_DAYS = 35
 const REMINDER_THRESHOLDS = [7200, 3600, 900]
@@ -178,6 +182,15 @@ export default function Home() {
     window.addEventListener('beforeinstallprompt', onPrompt)
     setIsStandalone(window.matchMedia('(display-mode: standalone)').matches || (window.navigator as any).standalone === true)
     return () => window.removeEventListener('beforeinstallprompt', onPrompt)
+  }, [])
+
+  // Chrome/Android won't fire beforeinstallprompt at all without an active service worker —
+  // that was the actual reason "Download app" did nothing on Android before this. The worker
+  // itself does no caching, it just needs to exist and be active.
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => { /* older/unsupported browser — fine to skip */ })
+    }
   }, [])
 
   // Toasts never had a way to clear themselves — an error or "Proof sent." would sit there until
@@ -448,10 +461,12 @@ export default function Home() {
   async function saveRoomSettings(e: FormEvent<HTMLFormElement>) {
     if (!db || !room) return
     e.preventDefault()
-    const boundary = String(new FormData(e.currentTarget).get('boundary'))
-    const { error } = await db.from('rooms').update({ day_boundary_time: boundary }).eq('id', room.id)
+    const form = new FormData(e.currentTarget)
+    const boundary = String(form.get('boundary'))
+    const timezone = String(form.get('timezone'))
+    const { error } = await db.from('rooms').update({ day_boundary_time: boundary, timezone }).eq('id', room.id)
     if (error) setNotice(error.message)
-    else { setNotice('Room clock updated.'); setShowProfileMenu(false); await loadDashboard({ ...room, day_boundary_time: boundary }) }
+    else { setNotice('Room clock updated.'); setShowProfileMenu(false); await loadDashboard({ ...room, day_boundary_time: boundary, timezone }) }
   }
 
   async function leaveRoom() {
@@ -622,6 +637,7 @@ export default function Home() {
   const calendarDays = Array.from({ length: HISTORY_DAYS }, (_, i) => daysAgoDate(HISTORY_DAYS - 1 - i))
   const roomFull = members.length >= 2
   const isIOS = typeof navigator !== 'undefined' && /iphone|ipad|ipod/i.test(navigator.userAgent)
+  const isAndroid = typeof navigator !== 'undefined' && /android/i.test(navigator.userAgent)
 
   return (
     <main className="dashboardV2">
@@ -701,6 +717,7 @@ export default function Home() {
                 {notifPermission === 'granted' && <span className="tinyLink" style={{ cursor: 'default' }}>🔔 Reminders on</span>}
                 {installPrompt && !isStandalone && <button className="tinyLink" type="button" onClick={installApp}>⬇ Download app</button>}
                 {!installPrompt && !isStandalone && isIOS && <span className="tinyLink" style={{ cursor: 'default' }}>⬇ Add to Home Screen via the Share menu</span>}
+                {!installPrompt && !isStandalone && isAndroid && <span className="tinyLink" style={{ cursor: 'default' }}>⬇ Use your browser menu → "Install app"</span>}
               </div>
             </section>
 
@@ -718,7 +735,7 @@ export default function Home() {
                       <b>{p.profiles?.display_name || 'Your partner'} · {p.daily_tasks?.platform}</b>
                       <small>
                         {p.kind === 'image' ? (signedUrls[p.id] ? <a href={signedUrls[p.id]} target="_blank" rel="noreferrer">View photo →</a> : 'Loading photo…')
-                          : p.kind === 'link' ? p.link : p.note} · {p.daily_tasks?.points} points
+                          : p.kind === 'link' ? <a href={p.link!} target="_blank" rel="noreferrer">{p.link}</a> : p.note} · {p.daily_tasks?.points} points
                       </small>
                     </div>
                     {rejectingProof?.id === p.id ? (
@@ -808,7 +825,7 @@ export default function Home() {
                 <div>
                   <b>{p.profiles?.display_name || nameFor(p.user_id)} · {p.daily_tasks?.platform}</b>
                   <small>
-                    {p.kind === 'image' ? (signedUrls[p.id] ? <a href={signedUrls[p.id]} target="_blank" rel="noreferrer">View photo →</a> : 'Loading photo…') : p.kind === 'link' ? p.link : p.note}
+                    {p.kind === 'image' ? (signedUrls[p.id] ? <a href={signedUrls[p.id]} target="_blank" rel="noreferrer">View photo →</a> : 'Loading photo…') : p.kind === 'link' ? <a href={p.link!} target="_blank" rel="noreferrer">{p.link}</a> : p.note}
                   </small>
                   <span className={`proof ${p.status}`}>{p.status === 'approved' ? 'Confirmed ✓' : p.status === 'rejected' ? 'Rejected' : 'Awaiting review'}</span>
                 </div>
@@ -932,6 +949,8 @@ export default function Home() {
               <form onSubmit={saveRoomSettings}>
                 <label>When does your day reset?</label>
                 <select name="boundary" defaultValue={room.day_boundary_time.slice(0, 5)}>{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select>
+                <label>Timezone</label>
+                <select name="timezone" defaultValue={room.timezone}>{TIMEZONE_OPTIONS.map(tz => <option key={tz} value={tz}>{tz}</option>)}</select>
                 <button>Save clock</button>
               </form>
             )}
