@@ -327,8 +327,14 @@ export default function Home() {
     try {
       const { data: platRows } = await db.from('profile_platforms').select('platform')
       if (!platRows || platRows.length < 3) { setMode('platforms'); return }
-      const { data: authUser } = await db.auth.getUser()
-      const myId = authUser.user?.id
+      // A flaky connection can make this getUser() call resolve with no user (rather than
+      // throwing) instead of erroring outright. Left unchecked, myId silently became the string
+      // "undefined" in the next query below (?user_id=eq.undefined, a 400 that supabase-js
+      // returns as {data: null, error} rather than throwing) — which read as "you have zero
+      // rooms" and sent someone who's actually a member of a room back through onboarding.
+      const { data: authUser, error: userErr } = await db.auth.getUser()
+      if (userErr || !authUser.user) throw userErr || new Error('Lost your session — please sign in again.')
+      const myId = authUser.user.id
       // Without filtering to my own membership rows, a shared room would come back once per
       // member (RLS on room_members exposes every row in any room I belong to, not just mine).
       const { data: memberships } = await db.from('room_members').select('room_id,rooms(id,name,timezone,day_boundary_time)').eq('user_id', myId)
@@ -766,7 +772,7 @@ export default function Home() {
 
   if (mode === 'platforms') return <main className="welcome"><div><p className="eyebrow">PICK YOUR PLATFORMS</p><h1>Where do you<br/><i>want to grow?</i></h1><p>Pick at least 3. Every posting day we'll randomly choose 3 of these for you, worth 50 points split unevenly — keeps it interesting.</p></div><form className="card setup" onSubmit={savePlatforms}><div className="chipGrid">{PLATFORM_OPTIONS.map(p => <button type="button" key={p} className={selectedPlatforms.includes(p) ? 'picked' : ''} onClick={() => togglePlatform(p)}>{p}</button>)}</div><button disabled={selectedPlatforms.length < 3}>Continue → ({selectedPlatforms.length}/3)</button>{notice && <small>{notice}</small>}</form></main>
 
-  if (mode === 'profile') return <main className="welcome"><form className="card setup"><p className="eyebrow">{cameFromRoom ? 'ADD A ROOM' : 'YOUR PROFILE IS READY'}</p><h1>How do you want<br/><i>to show up?</i></h1><p>Start alone now, create a shared room for a friend, or join a friend who has already created one. Rooms are capped at 2 people.</p><div className="picks"><button type="button" onClick={() => setMode('setup')}><b>Use it solo</b><span>Your own daily posting goals</span></button><button type="button" onClick={() => setMode('setup')}><b>Create a room with a friend</b><span>Make an invite code after setup</span></button><button type="button" onClick={() => setMode('join')}><b>Join a friend</b><span>Enter their room code</span></button></div>{cameFromRoom && <button className="link" type="button" onClick={() => setMode('room')}>Back to dashboard</button>}</form></main>
+  if (mode === 'profile') return <main className="welcome"><form className="card setup"><p className="eyebrow">{cameFromRoom ? 'ADD A ROOM' : 'YOUR PROFILE IS READY'}</p><h1>How do you want<br/><i>to show up?</i></h1><p>Start alone now, create a shared room for a friend, or join a friend who has already created one. Rooms are capped at 2 people.</p><div className="picks"><button type="button" onClick={() => setMode('setup')}><b>Use it solo</b><span>Your own daily posting goals</span></button><button type="button" onClick={() => setMode('setup')}><b>Create a room with a friend</b><span>Make an invite code after setup</span></button><button type="button" onClick={() => setMode('join')}><b>Join a friend</b><span>Enter their room code</span></button></div>{cameFromRoom && <button className="link" type="button" onClick={() => setMode('room')}>Back to dashboard</button>}{!cameFromRoom && <button className="link" type="button" onClick={() => checkUserState()}>Already in a room? Check again</button>}</form></main>
 
   if (mode === 'join') return <main className="welcome"><form className="card setup" onSubmit={joinRoom}><p className="eyebrow">JOIN A ROOM</p><h1>Bring your<br/><i>friend's code.</i></h1><input required name="code" placeholder="Invite code" /><label>Your rest days (pick up to 2)</label><WeekdayPicker selected={joinRestDays} onToggle={toggleJoinRestDay} /><button>Join room →</button><button className="link" type="button" onClick={() => setMode(myRooms.length ? 'room' : 'profile')}>Back</button>{notice && <small>{notice}</small>}</form></main>
 
