@@ -90,6 +90,12 @@ function readStoredRoomId() {
 function storeRoomId(id: string) {
   try { localStorage.setItem(ACTIVE_ROOM_KEY, id) } catch { /* private browsing etc — fine to skip */ }
 }
+// Matches "example.com", "www.example.com/path", "http(s)://example.com" — not just fully
+// qualified URLs, since most people paste a bare domain without typing the protocol.
+const URL_LIKE = /^(https?:\/\/)?([\w-]+\.)+[a-z]{2,}(:\d+)?(\/\S*)?$/i
+function normalizeLink(text: string) {
+  return /^https?:\/\//i.test(text) ? text : `https://${text}`
+}
 function avatarColor(id: string) {
   let h = 0
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0
@@ -524,7 +530,7 @@ export default function Home() {
     let kind: 'image' | 'link' | 'note'
     let link: string | null = null, note: string | null = null, filePath: string | null = null
     if (file) { kind = 'image'; filePath = `${user.id}/${crypto.randomUUID()}-${file.name.replace(/[^a-zA-Z0-9_.-]/g, '_')}` }
-    else if (/^https?:\/\//.test(text)) { kind = 'link'; link = text }
+    else if (URL_LIKE.test(text)) { kind = 'link'; link = normalizeLink(text) }
     else { kind = 'note'; note = text }
 
     try {
@@ -715,9 +721,6 @@ export default function Home() {
               <div className="countCardActions">
                 {notifPermission !== 'unsupported' && notifPermission !== 'granted' && <button className="tinyLink" type="button" onClick={enableReminders}>🔔 Get reminders</button>}
                 {notifPermission === 'granted' && <span className="tinyLink" style={{ cursor: 'default' }}>🔔 Reminders on</span>}
-                {installPrompt && !isStandalone && <button className="tinyLink" type="button" onClick={installApp}>⬇ Download app</button>}
-                {!installPrompt && !isStandalone && isIOS && <span className="tinyLink" style={{ cursor: 'default' }}>⬇ Add to Home Screen via the Share menu</span>}
-                {!installPrompt && !isStandalone && isAndroid && <span className="tinyLink" style={{ cursor: 'default' }}>⬇ Use your browser menu → "Install app"</span>}
               </div>
             </section>
 
@@ -953,6 +956,17 @@ export default function Home() {
                 <select name="timezone" defaultValue={room.timezone}>{TIMEZONE_OPTIONS.map(tz => <option key={tz} value={tz}>{tz}</option>)}</select>
                 <button>Save clock</button>
               </form>
+            )}
+
+            {!isStandalone && (installPrompt || isIOS || isAndroid) && (
+              <>
+                <label>Get the app</label>
+                {installPrompt
+                  ? <button type="button" onClick={installApp}>⬇ Download app</button>
+                  : isIOS
+                    ? <p className="dim">Tap the Share icon in Safari, then "Add to Home Screen".</p>
+                    : <p className="dim">Open your browser menu and choose "Install app".</p>}
+              </>
             )}
 
             <div className="inlineActions">
