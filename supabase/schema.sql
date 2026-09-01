@@ -352,7 +352,7 @@ begin
       and not exists (select 1 from public.room_day_state s where s.room_id = target_room and s.cycle_date = dt.cycle_date and s.settled)
     order by dt.cycle_date
   loop
-    select coalesce(sum(p.points),0) into combined
+    select coalesce(sum(dt.points),0) into combined
       from public.proofs p join public.daily_tasks dt on dt.id = p.task_id
       where dt.room_id = target_room and dt.cycle_date = d and p.status = 'approved';
 
