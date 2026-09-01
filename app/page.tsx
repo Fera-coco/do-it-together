@@ -152,7 +152,9 @@ export default function Home() {
   const [setupRestDays, setSetupRestDays] = useState<number[]>([])
   const [joinRestDays, setJoinRestDays] = useState<number[]>([])
   const [weekPickerDays, setWeekPickerDays] = useState<number[]>([])
-  const [showSettings, setShowSettings] = useState(false)
+  const [showProfileMenu, setShowProfileMenu] = useState(false)
+  const [myPlatforms, setMyPlatforms] = useState<string[]>([])
+  const [editPlatforms, setEditPlatforms] = useState<string[]>([])
   const [proofModalTask, setProofModalTask] = useState<DailyTask | null>(null)
   const [proofFile, setProofFile] = useState<File | null>(null)
   const [rejectingProof, setRejectingProof] = useState<Proof | null>(null)
@@ -277,7 +279,7 @@ export default function Home() {
     if (!db) return
     setRoom(roomRow)
     storeRoomId(roomRow.id)
-    setShowSettings(false)
+    setShowProfileMenu(false)
     const [{ data: memberRows }, { data: status, error: statusError }] = await Promise.all([
       db.from('room_members').select('user_id,role,rest_days,profiles(display_name)').eq('room_id', roomRow.id),
       db.rpc('get_today_status', { target_room: roomRow.id }),
@@ -301,7 +303,7 @@ export default function Home() {
     const since = daysAgoDate(HISTORY_DAYS - 1)
     const [
       { data: allTasks }, { data: proofRows }, { data: dayRows }, { data: weekRows }, { data: chatRows },
-      { data: histTaskRows }, { data: approvedRows }, { data: feedRows }, inviteResult,
+      { data: histTaskRows }, { data: approvedRows }, { data: feedRows }, { data: platRows }, inviteResult,
     ] = await Promise.all([
       db.from('daily_tasks').select('id,user_id,platform,points').eq('room_id', roomRow.id).eq('cycle_date', cdate).neq('platform', '__rest__'),
       db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,profiles(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).eq('task_date', cdate),
@@ -311,6 +313,7 @@ export default function Home() {
       db.from('daily_tasks').select('id,user_id,cycle_date,platform').eq('room_id', roomRow.id).gte('cycle_date', since),
       db.from('proofs').select('task_id').eq('room_id', roomRow.id).eq('status', 'approved').gte('task_date', since),
       db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,created_at,profiles(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(30),
+      db.from('profile_platforms').select('platform').eq('user_id', myId),
       amOwner
         ? db.from('room_invites').select('code,uses,max_uses').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(1).maybeSingle()
         : Promise.resolve({ data: null as any }),
@@ -326,6 +329,7 @@ export default function Home() {
     setApprovedTaskIds(new Set(((approvedRows as any) || []).map((r: any) => r.task_id)))
     const feedList: Proof[] = (feedRows as any) || []
     setFeedProofs(feedList)
+    setMyPlatforms(((platRows as any) || []).map((r: any) => r.platform))
     setInviteCode(inviteResult.data && inviteResult.data.uses < inviteResult.data.max_uses ? inviteResult.data.code : '')
 
     const myWeek = weekList.find(w => w.user_id === myId)
@@ -443,7 +447,7 @@ export default function Home() {
     const boundary = String(new FormData(e.currentTarget).get('boundary'))
     const { error } = await db.from('rooms').update({ day_boundary_time: boundary }).eq('id', room.id)
     if (error) setNotice(error.message)
-    else { setNotice('Room clock updated.'); setShowSettings(false); await loadDashboard({ ...room, day_boundary_time: boundary }) }
+    else { setNotice('Room clock updated.'); setShowProfileMenu(false); await loadDashboard({ ...room, day_boundary_time: boundary }) }
   }
 
   async function leaveRoom() {
@@ -452,7 +456,7 @@ export default function Home() {
     const { error } = await db.rpc('leave_room', { target_room: room.id })
     if (error) { setNotice(error.message); return }
     setNotice('Left the room.')
-    setShowSettings(false)
+    setShowProfileMenu(false)
     await checkUserState()
   }
 
@@ -462,8 +466,32 @@ export default function Home() {
     const { error } = await db.rpc('delete_room', { target_room: room.id })
     if (error) { setNotice(error.message); return }
     setNotice('Room deleted.')
-    setShowSettings(false)
+    setShowProfileMenu(false)
     await checkUserState()
+  }
+
+  async function saveDisplayName(e: FormEvent<HTMLFormElement>) {
+    if (!db || !user) return
+    e.preventDefault()
+    const name = String(new FormData(e.currentTarget).get('displayName') || '').trim()
+    if (!name) { setNotice("Name can't be empty."); return }
+    const { error } = await db.from('profiles').update({ display_name: name }).eq('id', user.id)
+    if (error) { setNotice(error.message); return }
+    setNotice('Name updated.')
+    if (room) await loadDashboard(room)
+  }
+
+  function toggleEditPlatform(p: string) {
+    setEditPlatforms(prev => prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])
+  }
+
+  async function savePlatformsEdit() {
+    if (!db) return
+    if (editPlatforms.length < 3) { setNotice('Pick at least 3 platforms.'); return }
+    const { error } = await db.rpc('set_profile_platforms', { platforms: editPlatforms })
+    if (error) { setNotice(error.message); return }
+    setMyPlatforms(editPlatforms)
+    setNotice("Platforms updated — this changes what future days draw from, not today's already-assigned tasks.")
   }
 
   async function submitProofModal(e: FormEvent<HTMLFormElement>) {
@@ -474,8 +502,6 @@ export default function Home() {
     if (!text && !file) { setNotice('Add a link, a note, or a photo.'); return }
 
     const task = proofModalTask
-    const existing = myProofs.find(p => p.task_id === task.id)
-    const proofId = existing?.id || crypto.randomUUID()
     let kind: 'image' | 'link' | 'note'
     let link: string | null = null, note: string | null = null, filePath: string | null = null
     if (file) { kind = 'image'; filePath = `${user.id}/${crypto.randomUUID()}-${file.name.replace(/[^a-zA-Z0-9_.-]/g, '_')}` }
@@ -490,10 +516,16 @@ export default function Home() {
         if (upErr) { setNotice(upErr.message); return }
       }
 
-      const payload = { kind, link, note, file_path: filePath, status: 'submitted' as const, reviewed_by: null, reviewed_at: null, rejection_reason: null }
-      const { error } = existing
-        ? await db.from('proofs').update(payload).eq('id', proofId)
-        : await db.from('proofs').insert({ id: proofId, room_id: room.id, task_id: task.id, user_id: user.id, task_date: cycleDate, ...payload })
+      // Upsert on task_id (its unique key) rather than branching on whatever proof the local
+      // state happens to already know about — a stale/incomplete local list otherwise tries an
+      // INSERT against a task_id that already has a row and crashes on a duplicate-key error.
+      const { data, error } = await db.from('proofs')
+        .upsert(
+          { room_id: room.id, task_id: task.id, user_id: user.id, task_date: cycleDate, kind, link, note, file_path: filePath, status: 'submitted', reviewed_by: null, reviewed_at: null, rejection_reason: null },
+          { onConflict: 'task_id' },
+        )
+        .select('id')
+        .single()
       if (error) {
         if (filePath) await db.storage.from('proof-images').remove([filePath])
         setNotice(error.message)
@@ -504,8 +536,8 @@ export default function Home() {
       // "Waiting for partner" right away instead of sitting on "Submit proof" until whatever
       // background reload happens to land.
       setProofs(prev => [
-        ...prev.filter(p => p.id !== proofId),
-        { id: proofId, task_id: task.id, user_id: user.id, status: 'submitted', kind, note, link, file_path: filePath,
+        ...prev.filter(p => p.id !== data.id),
+        { id: data.id, task_id: task.id, user_id: user.id, status: 'submitted', kind, note, link, file_path: filePath,
           profiles: { display_name: myName }, daily_tasks: { platform: task.platform, points: task.points } },
       ])
       setNotice('Proof sent.')
@@ -610,7 +642,9 @@ export default function Home() {
       <section className="mainPane">
         <div className="dateRow">
           <span className="dateLabel">{cycleDate ? formatFullDate(cycleDate) : ''}</span>
-          <span className="avatar" style={{ background: avatarColor(myId || '') }}>{myName[0]?.toUpperCase()}</span>
+          <button className="avatarBtn" type="button" onClick={() => { setEditPlatforms(myPlatforms); setShowProfileMenu(true) }}>
+            <span className="avatar" style={{ background: avatarColor(myId || '') }}>{myName[0]?.toUpperCase()}</span>
+          </button>
         </div>
 
         {needsWeekPick && (
@@ -659,30 +693,12 @@ export default function Home() {
               <strong>{time}</strong>
               <span>Resets at {room ? formatBoundary(room.day_boundary_time) : ''} ({room?.timezone}). Submit your proof before then.</span>
               <div className="countCardActions">
-                <button className="tinyLink" type="button" onClick={() => setShowSettings(s => !s)}>Room settings</button>
                 {notifPermission !== 'unsupported' && notifPermission !== 'granted' && <button className="tinyLink" type="button" onClick={enableReminders}>🔔 Get reminders</button>}
                 {notifPermission === 'granted' && <span className="tinyLink" style={{ cursor: 'default' }}>🔔 Reminders on</span>}
                 {installPrompt && !isStandalone && <button className="tinyLink" type="button" onClick={installApp}>⬇ Download app</button>}
                 {!installPrompt && !isStandalone && isIOS && <span className="tinyLink" style={{ cursor: 'default' }}>⬇ Add to Home Screen via the Share menu</span>}
               </div>
             </section>
-
-            {showSettings && room && (
-              <div className="card settingsInline">
-                {isOwner && (
-                  <form onSubmit={saveRoomSettings}>
-                    <label>When does your day reset?</label>
-                    <select name="boundary" defaultValue={room.day_boundary_time.slice(0, 5)}>{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select>
-                    <button>Save</button>
-                  </form>
-                )}
-                <div className="inlineActions">
-                  <button className="link" type="button" onClick={() => setShowSettings(false)}>Cancel</button>
-                  <button className="dangerBtn" type="button" onClick={leaveRoom}>Leave room</button>
-                  {isOwner && <button className="dangerBtn" type="button" onClick={deleteRoomFn}>Delete room</button>}
-                </div>
-              </div>
-            )}
 
             <section className="progress">
               <b>{confirmed}/{target} points · {gradeLabel(confirmed)}</b>
@@ -886,6 +902,43 @@ export default function Home() {
             <button>Submit proof →</button>
             <button className="link" type="button" onClick={() => { setProofModalTask(null); setProofFile(null) }}>Cancel</button>
           </form>
+        </div>
+      )}
+
+      {showProfileMenu && (
+        <div className="modalOverlay" onClick={() => setShowProfileMenu(false)}>
+          <div className="card modalCard" onClick={e => e.stopPropagation()}>
+            <h2>Your profile</h2>
+
+            <form onSubmit={saveDisplayName}>
+              <label>Display name</label>
+              <input name="displayName" defaultValue={myName} maxLength={40} />
+              <button>Save name</button>
+            </form>
+
+            <label>Platforms you're focused on (pick at least 3)</label>
+            <div className="chipGrid">
+              {PLATFORM_OPTIONS.map(p => (
+                <button type="button" key={p} className={editPlatforms.includes(p) ? 'picked' : ''} onClick={() => toggleEditPlatform(p)}>{p}</button>
+              ))}
+            </div>
+            <button type="button" onClick={savePlatformsEdit} disabled={editPlatforms.length < 3}>Save platforms ({editPlatforms.length}/3)</button>
+
+            {room && isOwner && (
+              <form onSubmit={saveRoomSettings}>
+                <label>When does your day reset?</label>
+                <select name="boundary" defaultValue={room.day_boundary_time.slice(0, 5)}>{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select>
+                <button>Save clock</button>
+              </form>
+            )}
+
+            <div className="inlineActions">
+              <button className="dangerBtn" type="button" onClick={leaveRoom}>Leave room</button>
+              {room && isOwner && <button className="dangerBtn" type="button" onClick={deleteRoomFn}>Delete room</button>}
+            </div>
+
+            <button className="link" type="button" onClick={() => setShowProfileMenu(false)}>Close</button>
+          </div>
         </div>
       )}
 

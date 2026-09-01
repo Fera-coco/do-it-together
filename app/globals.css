@@ -17,6 +17,9 @@ header{display:flex;align-items:center;justify-content:space-between;gap:16px;fl
 .inlineActions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.inlineActions button{width:auto;background:#514394;color:#fff;border-radius:8px;padding:10px 14px;font-size:12px;font-weight:700}.dangerBtn{background:#fff!important;color:#9c4551!important;border:1px solid #dfb9be!important}
 .tinyLink{width:auto;background:transparent!important;color:#514394!important;font-size:11px;font-weight:700;margin-top:8px;padding:0;text-decoration:underline}
 .settingsInline{margin-top:12px}.settingsInline label{display:block;font-size:12px;font-weight:700;margin:0 0 6px}
+.avatarBtn{background:transparent;border:0;padding:0;cursor:pointer;border-radius:50%;line-height:0}
+.modalCard label{display:block;font-size:12px;font-weight:700;margin:14px 0 6px}
+.modalCard form{margin:0}
 .dim{color:#9a918b;font-size:12px}
 .chatSection{margin-top:40px}.chatLog{max-height:280px;overflow-y:auto;-webkit-overflow-scrolling:touch;border:1px solid #e4ded5;border-radius:14px;background:#fffefa;padding:14px;display:flex;flex-direction:column;gap:10px}.chatBubble{max-width:80%;background:#f4f1ea;border-radius:12px;padding:8px 12px;align-self:flex-start}.chatBubble.mine{align-self:flex-end;background:#eee9ff}.chatBubble small{display:block;font:10px 'DM Mono';color:#9a91a5;margin-bottom:3px}.chatBubble p{margin:0;font-size:13px;color:#332d40;overflow-wrap:anywhere}.chatForm{display:flex;gap:8px;margin-top:10px}.chatForm input{flex:1;min-width:0;padding:12px 13px;border:1px solid #ded8d1;border-radius:9px;font-size:16px}.chatForm button{width:auto;background:#514394;color:#fff;border-radius:9px;padding:12px 16px;font-weight:700;font-size:13px}
 .fileLabel{display:block;text-align:center;color:#514394;font-size:12px;font-weight:700;padding:12px;border:1px dashed #ded8d1;border-radius:9px;margin:6px 0 0;cursor:pointer}
