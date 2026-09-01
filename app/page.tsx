@@ -306,13 +306,17 @@ export default function Home() {
       { data: histTaskRows }, { data: approvedRows }, { data: feedRows }, { data: platRows }, inviteResult,
     ] = await Promise.all([
       db.from('daily_tasks').select('id,user_id,platform,points').eq('room_id', roomRow.id).eq('cycle_date', cdate).neq('platform', '__rest__'),
-      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,profiles(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).eq('task_date', cdate),
+      // profiles!user_id disambiguates the embed: proofs has two FKs into profiles (user_id
+      // and reviewed_by), so a bare "profiles(display_name)" is an ambiguous embed that
+      // PostgREST rejects with HTTP 300 — which supabase-js surfaces as {data: null, error},
+      // silently emptying this list and reverting a just-submitted proof back to "Submit proof".
+      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,profiles!user_id(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).eq('task_date', cdate),
       db.from('room_day_state').select('cycle_date,combined_points,grade').eq('room_id', roomRow.id).order('cycle_date', { ascending: false }).limit(HISTORY_DAYS),
       db.from('member_week_state').select('user_id,rest_credits_remaining,rest_days').eq('room_id', roomRow.id).eq('week_start', weekStart),
       db.from('room_messages').select('id,user_id,body,created_at').eq('room_id', roomRow.id).order('created_at', { ascending: true }).limit(100),
       db.from('daily_tasks').select('id,user_id,cycle_date,platform').eq('room_id', roomRow.id).gte('cycle_date', since),
       db.from('proofs').select('task_id').eq('room_id', roomRow.id).eq('status', 'approved').gte('task_date', since),
-      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,created_at,profiles(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(30),
+      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,created_at,profiles!user_id(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(30),
       db.from('profile_platforms').select('platform').eq('user_id', myId),
       amOwner
         ? db.from('room_invites').select('code,uses,max_uses').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(1).maybeSingle()
