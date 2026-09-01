@@ -165,7 +165,11 @@ export default function Home() {
   const [mode, setMode] = useState<Mode>('loading')
   const [dashTab, setDashTab] = useState<DashTab>('today')
   const [cameFromRoom, setCameFromRoom] = useState(false)
-  const [authView, setAuthView] = useState<'signup' | 'signin'>('signup')
+  const [authView, setAuthView] = useState<'signup' | 'signin' | 'forgot' | 'reset'>('signup')
+  const [authBusy, setAuthBusy] = useState(false)
+  const [proofSubmitting, setProofSubmitting] = useState(false)
+  const [isOffline, setIsOffline] = useState(false)
+  const recoveryFlowRef = useRef(false)
   const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>([])
   const [setupRestDays, setSetupRestDays] = useState<number[]>([])
   const [joinRestDays, setJoinRestDays] = useState<number[]>([])
@@ -186,6 +190,16 @@ export default function Home() {
   useEffect(() => {
     if (typeof Notification === 'undefined') return
     setNotifPermission(Notification.permission)
+  }, [])
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined') return
+    setIsOffline(!navigator.onLine)
+    const goOnline = () => setIsOffline(false)
+    const goOffline = () => setIsOffline(true)
+    window.addEventListener('online', goOnline)
+    window.addEventListener('offline', goOffline)
+    return () => { window.removeEventListener('online', goOnline); window.removeEventListener('offline', goOffline) }
   }, [])
 
   // Chrome/Android fires this instead of doing anything on its own; we stash it so an explicit
@@ -219,15 +233,32 @@ export default function Home() {
     if (!db) return
     // A rejected getUser()/checkUserState() call here (a network hiccup, a dropped connection)
     // used to leave `mode` stuck at 'loading' forever with no error and no way out except a
-    // hard refresh — this is the splash screen that never goes away. Catch it and fall back to
-    // the sign-in screen instead.
-    db.auth.getUser().then(({ data }) => {
-      setUser(data.user)
-      if (data.user) checkUserState()
-      else setMode('auth')
-    }).catch(() => setMode('auth'))
+    // hard refresh — this is the splash screen that never goes away. bootAuth retries once
+    // before falling back to the sign-in screen, since on a poor connection a lot of these are
+    // transient blips rather than a real problem.
+    async function bootAuth(retrying = false): Promise<void> {
+      if (!db) return
+      try {
+        const { data } = await db.auth.getUser()
+        setUser(data.user)
+        if (recoveryFlowRef.current) return
+        if (data.user) await checkUserState()
+        else setMode('auth')
+      } catch {
+        if (recoveryFlowRef.current) return
+        if (!retrying) { await new Promise(r => setTimeout(r, 1500)); return bootAuth(true) }
+        setMode('auth')
+      }
+    }
+    bootAuth()
     const { data: { subscription } } = db.auth.onAuthStateChange((_e, s) => {
       setUser(s?.user ?? null)
+      // A password-recovery link lands here with a real (temporary) session already
+      // established, but we want the "set a new password" form first, not the dashboard — and
+      // that has to stick even though the bootAuth() call above may still independently resolve
+      // and see the same signed-in user.
+      if (_e === 'PASSWORD_RECOVERY') { recoveryFlowRef.current = true; setMode('auth'); setAuthView('reset'); return }
+      if (recoveryFlowRef.current) return
       if (s?.user) checkUserState()
       else { setRoom(null); setMyRooms([]); setMode('auth') }
     })
@@ -419,11 +450,56 @@ export default function Home() {
     e.preventDefault()
     const form = new FormData(e.currentTarget)
     const email = String(form.get('email')), password = String(form.get('password')), name = String(form.get('name'))
-    const result = authView === 'signup'
-      ? await db.auth.signUp({ email, password, options: { data: { display_name: name } } })
-      : await db.auth.signInWithPassword({ email, password })
-    if (result.error) setNotice(result.error.message)
-    else setNotice(authView === 'signup' ? 'Account created. Check your email if confirmation is turned on.' : 'Welcome back.')
+    setAuthBusy(true)
+    try {
+      const result = authView === 'signup'
+        ? await db.auth.signUp({ email, password, options: { data: { display_name: name } } })
+        : await db.auth.signInWithPassword({ email, password })
+      if (result.error) setNotice(result.error.message)
+      else setNotice(authView === 'signup' ? 'Account created. Check your email if confirmation is turned on.' : 'Welcome back.')
+    } catch (err: any) {
+      setNotice(err?.message || 'Could not reach the server — check your connection and try again.')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function forgotPassword(e: FormEvent<HTMLFormElement>) {
+    if (!db) return
+    e.preventDefault()
+    const email = String(new FormData(e.currentTarget).get('email') || '').trim()
+    setAuthBusy(true)
+    try {
+      const { error } = await db.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin })
+      setNotice(error ? error.message : "If that email has an account, we've sent a password reset link.")
+    } catch (err: any) {
+      setNotice(err?.message || 'Could not reach the server — check your connection and try again.')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function resetPassword(e: FormEvent<HTMLFormElement>) {
+    if (!db) return
+    e.preventDefault()
+    const form = new FormData(e.currentTarget)
+    const password = String(form.get('password') || '')
+    const confirmPassword = String(form.get('confirmPassword') || '')
+    if (password.length < 6) { setNotice('Password must be at least 6 characters.'); return }
+    if (password !== confirmPassword) { setNotice("Passwords don't match."); return }
+    setAuthBusy(true)
+    try {
+      const { error } = await db.auth.updateUser({ password })
+      if (error) { setNotice(error.message); return }
+      recoveryFlowRef.current = false
+      setNotice('Password updated.')
+      setAuthView('signin')
+      await checkUserState()
+    } catch (err: any) {
+      setNotice(err?.message || 'Could not reach the server — check your connection and try again.')
+    } finally {
+      setAuthBusy(false)
+    }
   }
 
   function togglePlatform(p: string) {
@@ -564,6 +640,7 @@ export default function Home() {
     else if (URL_LIKE.test(text)) { kind = 'link'; link = normalizeLink(text) }
     else { kind = 'note'; note = text }
 
+    setProofSubmitting(true)
     try {
       // Upload first — the file is in storage before anything else can reference it, so a
       // partner's realtime reload never asks for a signed URL that isn't ready yet.
@@ -602,6 +679,8 @@ export default function Home() {
       await loadDashboard(room)
     } catch (err: any) {
       setNotice(err?.message || 'Something went wrong sending that proof — try again.')
+    } finally {
+      setProofSubmitting(false)
     }
   }
 
@@ -650,7 +729,40 @@ export default function Home() {
 
   if (mode === 'loading') return <main className="splash"><b className="brand">↗ <span>do it<br />together</span></b><span className="splashPulse" /></main>
 
-  if (mode === 'auth') return <main className="welcome"><div><p className="eyebrow">DO IT TOGETHER</p><h1>Show up.<br/><i>Together.</i></h1><p>Build your own social rhythm, then invite a friend whenever you want accountability.</p></div><form className="card" onSubmit={auth}><h2>{authView === 'signup' ? 'Create your profile' : 'Welcome back'}</h2>{authView === 'signup' && <input required name="name" placeholder="Your name" />}<input required name="email" type="email" placeholder="Email" /><input required name="password" type="password" placeholder="Password" minLength={6} /><button>{authView === 'signup' ? 'Create profile →' : 'Sign in →'}</button><button className="link" type="button" onClick={() => { setAuthView(authView === 'signup' ? 'signin' : 'signup'); setNotice('') }}>{authView === 'signup' ? 'I already have an account' : 'Create a new account'}</button>{notice && <small>{notice}</small>}</form></main>
+  if (mode === 'auth') return (
+    <main className="welcome">
+      <div><p className="eyebrow">DO IT TOGETHER</p><h1>Show up.<br /><i>Together.</i></h1><p>Build your own social rhythm, then invite a friend whenever you want accountability.</p></div>
+      {isOffline && <p className="offlineBanner">You're offline — reconnect to sign in.</p>}
+      {authView === 'reset' ? (
+        <form className="card" onSubmit={resetPassword}>
+          <h2>Set a new password</h2>
+          <input required name="password" type="password" placeholder="New password" minLength={6} />
+          <input required name="confirmPassword" type="password" placeholder="Confirm new password" minLength={6} />
+          <button disabled={authBusy}>{authBusy ? 'Saving…' : 'Set password →'}</button>
+          {notice && <small>{notice}</small>}
+        </form>
+      ) : authView === 'forgot' ? (
+        <form className="card" onSubmit={forgotPassword}>
+          <h2>Reset your password</h2>
+          <input required name="email" type="email" placeholder="Email" />
+          <button disabled={authBusy}>{authBusy ? 'Sending…' : 'Send reset link →'}</button>
+          <button className="link" type="button" onClick={() => { setAuthView('signin'); setNotice('') }}>Back to sign in</button>
+          {notice && <small>{notice}</small>}
+        </form>
+      ) : (
+        <form className="card" onSubmit={auth}>
+          <h2>{authView === 'signup' ? 'Create your profile' : 'Welcome back'}</h2>
+          {authView === 'signup' && <input required name="name" placeholder="Your name" />}
+          <input required name="email" type="email" placeholder="Email" />
+          <input required name="password" type="password" placeholder="Password" minLength={6} />
+          <button disabled={authBusy}>{authBusy ? 'Please wait…' : (authView === 'signup' ? 'Create profile →' : 'Sign in →')}</button>
+          {authView === 'signin' && <button className="link" type="button" onClick={() => { setAuthView('forgot'); setNotice('') }}>Forgot password?</button>}
+          <button className="link" type="button" onClick={() => { setAuthView(authView === 'signup' ? 'signin' : 'signup'); setNotice('') }}>{authView === 'signup' ? 'I already have an account' : 'Create a new account'}</button>
+          {notice && <small>{notice}</small>}
+        </form>
+      )}
+    </main>
+  )
 
   if (mode === 'platforms') return <main className="welcome"><div><p className="eyebrow">PICK YOUR PLATFORMS</p><h1>Where do you<br/><i>want to grow?</i></h1><p>Pick at least 3. Every posting day we'll randomly choose 3 of these for you, worth 50 points split unevenly — keeps it interesting.</p></div><form className="card setup" onSubmit={savePlatforms}><div className="chipGrid">{PLATFORM_OPTIONS.map(p => <button type="button" key={p} className={selectedPlatforms.includes(p) ? 'picked' : ''} onClick={() => togglePlatform(p)}>{p}</button>)}</div><button disabled={selectedPlatforms.length < 3}>Continue → ({selectedPlatforms.length}/3)</button>{notice && <small>{notice}</small>}</form></main>
 
@@ -701,6 +813,7 @@ export default function Home() {
       </aside>
 
       <section className="mainPane">
+        {isOffline && <p className="offlineBanner">You're offline — changes won't save until you're back online.</p>}
         <div className="dateRow">
           <span className="dateLabel">{cycleDate ? formatFullDate(cycleDate) : ''}</span>
           <button className="avatarBtn" type="button" onClick={() => { setEditPlatforms(myPlatforms); setShowProfileMenu(true) }}>
@@ -963,8 +1076,8 @@ export default function Home() {
               {proofFile ? proofFile.name : 'Or attach a photo →'}
               <input type="file" accept="image/*" onChange={e => setProofFile(e.target.files?.[0] || null)} hidden />
             </label>
-            <button>Submit proof →</button>
-            <button className="link" type="button" onClick={() => { setProofModalTask(null); setProofFile(null) }}>Cancel</button>
+            <button disabled={proofSubmitting}>{proofSubmitting ? 'Sending…' : 'Submit proof →'}</button>
+            <button className="link" type="button" disabled={proofSubmitting} onClick={() => { setProofModalTask(null); setProofFile(null) }}>Cancel</button>
           </form>
         </div>
       )}
