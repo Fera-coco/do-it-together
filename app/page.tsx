@@ -53,14 +53,22 @@ function gradeLabel(points: number) {
   if (points >= 50) return 'Mid'
   return 'Missed'
 }
+// Both of these do their arithmetic entirely in UTC-space (Date.UTC / getUTCDay / setUTCDate)
+// rather than mixing local-timezone parsing with a final toISOString(). Building a Date from a
+// local midnight and then calling toISOString() re-expresses it in UTC, which silently shifts
+// the calendar date backward by a day for anyone in a timezone ahead of UTC — that's what made
+// mondayOf() compute a week_start one day earlier than the one set_week_rest_days() actually
+// wrote server-side, so the client could never find its own saved rest-day row again.
 function mondayOf(dateStr: string) {
-  const d = new Date(dateStr + 'T00:00:00')
-  d.setDate(d.getDate() - ((d.getDay() + 6) % 7))
-  return d.toISOString().slice(0, 10)
+  const [y, m, d] = dateStr.split('-').map(Number)
+  const date = new Date(Date.UTC(y, m - 1, d))
+  date.setUTCDate(date.getUTCDate() - ((date.getUTCDay() + 6) % 7))
+  return date.toISOString().slice(0, 10)
 }
 function daysAgoDate(n: number) {
-  const d = new Date()
-  d.setDate(d.getDate() - n)
+  const now = new Date()
+  const d = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()))
+  d.setUTCDate(d.getUTCDate() - n)
   return d.toISOString().slice(0, 10)
 }
 function formatBoundary(t: string) {
