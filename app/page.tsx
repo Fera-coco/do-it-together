@@ -217,11 +217,15 @@ export default function Home() {
 
   useEffect(() => {
     if (!db) return
+    // A rejected getUser()/checkUserState() call here (a network hiccup, a dropped connection)
+    // used to leave `mode` stuck at 'loading' forever with no error and no way out except a
+    // hard refresh — this is the splash screen that never goes away. Catch it and fall back to
+    // the sign-in screen instead.
     db.auth.getUser().then(({ data }) => {
       setUser(data.user)
       if (data.user) checkUserState()
       else setMode('auth')
-    })
+    }).catch(() => setMode('auth'))
     const { data: { subscription } } = db.auth.onAuthStateChange((_e, s) => {
       setUser(s?.user ?? null)
       if (s?.user) checkUserState()
@@ -229,6 +233,14 @@ export default function Home() {
     })
     return () => subscription.unsubscribe()
   }, [db])
+
+  // Belt-and-suspenders on top of the catch above: whatever the cause, never leave the app
+  // stuck showing only the splash for more than a few seconds.
+  useEffect(() => {
+    if (mode !== 'loading') return
+    const t = setTimeout(() => setMode(m => (m === 'loading' ? 'auth' : m)), 6000)
+    return () => clearTimeout(t)
+  }, [mode])
 
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000)
@@ -281,19 +293,26 @@ export default function Home() {
 
   async function checkUserState() {
     if (!db) return
-    const { data: platRows } = await db.from('profile_platforms').select('platform')
-    if (!platRows || platRows.length < 3) { setMode('platforms'); return }
-    const { data: authUser } = await db.auth.getUser()
-    const myId = authUser.user?.id
-    // Without filtering to my own membership rows, a shared room would come back once per
-    // member (RLS on room_members exposes every row in any room I belong to, not just mine).
-    const { data: memberships } = await db.from('room_members').select('room_id,rooms(id,name,timezone,day_boundary_time)').eq('user_id', myId)
-    const rooms: RoomSummary[] = ((memberships as any) || []).map((m: any) => m.rooms).filter(Boolean)
-    setMyRooms(rooms)
-    if (!rooms.length) { setMode('profile'); return }
-    const stored = readStoredRoomId()
-    const active = rooms.find(r => r.id === stored) || rooms[0]
-    await loadDashboard(active)
+    try {
+      const { data: platRows } = await db.from('profile_platforms').select('platform')
+      if (!platRows || platRows.length < 3) { setMode('platforms'); return }
+      const { data: authUser } = await db.auth.getUser()
+      const myId = authUser.user?.id
+      // Without filtering to my own membership rows, a shared room would come back once per
+      // member (RLS on room_members exposes every row in any room I belong to, not just mine).
+      const { data: memberships } = await db.from('room_members').select('room_id,rooms(id,name,timezone,day_boundary_time)').eq('user_id', myId)
+      const rooms: RoomSummary[] = ((memberships as any) || []).map((m: any) => m.rooms).filter(Boolean)
+      setMyRooms(rooms)
+      if (!rooms.length) { setMode('profile'); return }
+      const stored = readStoredRoomId()
+      const active = rooms.find(r => r.id === stored) || rooms[0]
+      await loadDashboard(active)
+    } catch (err: any) {
+      // A network hiccup here used to leave the splash screen up forever (mode never left
+      // 'loading') with no way to recover short of a hard refresh.
+      setNotice(err?.message || 'Could not load your account — check your connection and try again.')
+      setMode('auth')
+    }
   }
 
   async function switchRoom(r: RoomSummary) {
@@ -624,9 +643,12 @@ export default function Home() {
     return done === memberTasks.length ? 'Done for today' : `${done} of ${memberTasks.length} done`
   }
 
-  if (mode === 'loading') return <main className="splash"><b className="brand">↗ <span>do it<br />together</span></b><span className="splashPulse" /></main>
-
+  // Checked before the loading splash so a genuinely misconfigured build (no Supabase env vars)
+  // shows this message instead of being masked forever behind the splash — the boot effect that
+  // would otherwise move `mode` past 'loading' never runs at all when db is null.
   if (!db) return <main className="welcome"><div><p className="eyebrow">DO IT TOGETHER</p><h1>Almost<br/><i>ready.</i></h1><p>Add the Supabase public URL and publishable key in <code>.env.local</code> to start your private room.</p></div></main>
+
+  if (mode === 'loading') return <main className="splash"><b className="brand">↗ <span>do it<br />together</span></b><span className="splashPulse" /></main>
 
   if (mode === 'auth') return <main className="welcome"><div><p className="eyebrow">DO IT TOGETHER</p><h1>Show up.<br/><i>Together.</i></h1><p>Build your own social rhythm, then invite a friend whenever you want accountability.</p></div><form className="card" onSubmit={auth}><h2>{authView === 'signup' ? 'Create your profile' : 'Welcome back'}</h2>{authView === 'signup' && <input required name="name" placeholder="Your name" />}<input required name="email" type="email" placeholder="Email" /><input required name="password" type="password" placeholder="Password" minLength={6} /><button>{authView === 'signup' ? 'Create profile →' : 'Sign in →'}</button><button className="link" type="button" onClick={() => { setAuthView(authView === 'signup' ? 'signin' : 'signup'); setNotice('') }}>{authView === 'signup' ? 'I already have an account' : 'Create a new account'}</button>{notice && <small>{notice}</small>}</form></main>
 
