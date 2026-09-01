@@ -167,7 +167,13 @@ create policy "user sees own platforms" on public.profile_platforms for select t
 -- enforces the "at least 3" rule that a plain RLS check couldn't express across sibling rows.
 
 create policy "owners see invites" on public.room_invites for select to authenticated using (exists (select 1 from public.room_members m where m.room_id = room_invites.room_id and m.user_id = (select auth.uid()) and m.role = 'owner'));
-create policy "owners create invites" on public.room_invites for insert to authenticated with check ((select auth.uid()) = created_by and exists (select 1 from public.room_members m where m.room_id = room_invites.room_id and m.user_id = (select auth.uid()) and m.role = 'owner'));
+-- The <2-members check makes the cap hold even against a raw insert, not just the UI hiding
+-- the "generate invite" button once a room is full.
+create policy "owners create invites" on public.room_invites for insert to authenticated with check (
+  (select auth.uid()) = created_by
+  and exists (select 1 from public.room_members m where m.room_id = room_invites.room_id and m.user_id = (select auth.uid()) and m.role = 'owner')
+  and (select count(*) from public.room_members m2 where m2.room_id = room_invites.room_id) < 2
+);
 
 create policy "members see daily tasks" on public.daily_tasks for select to authenticated using (exists (select 1 from public.room_members m where m.room_id = daily_tasks.room_id and m.user_id = (select auth.uid())));
 -- No insert/update/delete policy: daily_tasks rows are only ever created by get_today_status().
@@ -247,6 +253,42 @@ begin
 end; $$;
 revoke all on function public.join_room_with_invite(text,smallint[]) from public;
 grant execute on function public.join_room_with_invite(text,smallint[]) to authenticated;
+
+-- A member leaves their room. If they were the last one, the room (and everything cascading
+-- from it — tasks, proofs, chat, invites) is removed rather than left as an orphan with no
+-- members. If the leaver was the owner and someone remains, that partner is promoted so the
+-- room keeps someone able to adjust its clock or generate invites.
+create or replace function public.leave_room(target_room uuid)
+returns void language plpgsql security definer set search_path = '' as $$
+declare remaining uuid;
+begin
+  if auth.uid() is null then raise exception 'Not signed in'; end if;
+  delete from public.room_members where room_id = target_room and user_id = auth.uid();
+  if not found then raise exception 'Not a member of this room'; end if;
+  select user_id into remaining from public.room_members where room_id = target_room limit 1;
+  if remaining is null then
+    delete from public.rooms where id = target_room;
+  elsif not exists (select 1 from public.room_members where room_id = target_room and role = 'owner') then
+    update public.room_members set role = 'owner' where room_id = target_room and user_id = remaining;
+  end if;
+end; $$;
+revoke all on function public.leave_room(uuid) from public;
+grant execute on function public.leave_room(uuid) to authenticated;
+
+-- The owner deletes the room outright for everyone. rooms cascades to room_members, daily_tasks,
+-- proofs, room_day_state, member_week_state, room_messages and room_invites, so one delete is
+-- enough (proof-image storage objects are the one thing left orphaned — a known, accepted gap).
+create or replace function public.delete_room(target_room uuid)
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  if auth.uid() is null then raise exception 'Not signed in'; end if;
+  if not exists (select 1 from public.room_members where room_id = target_room and user_id = auth.uid() and role = 'owner') then
+    raise exception 'Only the room owner can delete this room';
+  end if;
+  delete from public.rooms where id = target_room;
+end; $$;
+revoke all on function public.delete_room(uuid) from public;
+grant execute on function public.delete_room(uuid) to authenticated;
 
 create or replace function public.set_profile_platforms(platforms text[])
 returns void language plpgsql security definer set search_path = '' as $$
@@ -442,8 +484,18 @@ revoke all on function public.handle_new_user() from public;
 create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
 
 insert into storage.buckets(id,name,public) values ('proof-images','proof-images',false) on conflict do nothing;
-create policy "users upload own proof image" on storage.objects for insert to authenticated with check (bucket_id = 'proof-images' and exists (select 1 from public.proofs p where p.id::text = (storage.foldername(name))[1] and p.user_id = (select auth.uid())));
-create policy "room members view proof images" on storage.objects for select to authenticated using (bucket_id = 'proof-images' and exists (select 1 from public.proofs p join public.room_members m on m.room_id = p.room_id where p.id::text = (storage.foldername(name))[1] and m.user_id = (select auth.uid())));
+-- Keyed by uploader id (not the proofs row it will end up attached to) so the client can upload
+-- the file BEFORE writing the proofs row, instead of having to insert a row that references a
+-- not-yet-uploaded file first. That ordering used to leave a brief window where a realtime
+-- viewer (the partner) could load a proof whose image wasn't in storage yet, get an empty
+-- signed URL, and never retry — this removes the ordering dependency that caused it.
+create policy "users upload own proof image" on storage.objects for insert to authenticated with check (
+  bucket_id = 'proof-images' and (storage.foldername(name))[1] = (select auth.uid())::text
+);
+create policy "room members view proof images" on storage.objects for select to authenticated using (
+  bucket_id = 'proof-images'
+  and exists (select 1 from public.proofs p join public.room_members m on m.room_id = p.room_id where p.file_path = name and m.user_id = (select auth.uid()))
+);
 
 grant usage on schema public to authenticated;
 grant select, insert, update, delete on all tables in schema public to authenticated;

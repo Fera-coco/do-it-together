@@ -157,6 +157,8 @@ export default function Home() {
   const [proofFile, setProofFile] = useState<File | null>(null)
   const [rejectingProof, setRejectingProof] = useState<Proof | null>(null)
   const [notifPermission, setNotifPermission] = useState<'default' | 'granted' | 'denied' | 'unsupported'>('unsupported')
+  const [installPrompt, setInstallPrompt] = useState<any>(null)
+  const [isStandalone, setIsStandalone] = useState(false)
   const [tick, setTick] = useState(0)
   const chatEndRef = useRef<HTMLDivElement>(null)
   const notifiedRef = useRef<Record<string, boolean>>({})
@@ -165,6 +167,24 @@ export default function Home() {
     if (typeof Notification === 'undefined') return
     setNotifPermission(Notification.permission)
   }, [])
+
+  // Chrome/Android fires this instead of doing anything on its own; we stash it so an explicit
+  // "Download app" button can trigger the native install prompt on demand. Safari (iOS/macOS)
+  // never fires it — those users get a manual "Add to Home Screen" hint instead (see isIOS below).
+  useEffect(() => {
+    const onPrompt = (e: any) => { e.preventDefault(); setInstallPrompt(e) }
+    window.addEventListener('beforeinstallprompt', onPrompt)
+    setIsStandalone(window.matchMedia('(display-mode: standalone)').matches || (window.navigator as any).standalone === true)
+    return () => window.removeEventListener('beforeinstallprompt', onPrompt)
+  }, [])
+
+  // Toasts never had a way to clear themselves — an error or "Proof sent." would sit there until
+  // something else happened to overwrite it, which looked like the page had frozen.
+  useEffect(() => {
+    if (!notice) return
+    const id = setTimeout(() => setNotice(''), 4000)
+    return () => clearTimeout(id)
+  }, [notice])
 
   useEffect(() => {
     if (!db) return
@@ -333,6 +353,13 @@ export default function Home() {
     setNotice(perm === 'granted' ? 'Reminders on — we\'ll nudge you as the clock runs down.' : 'Notifications permission was not granted.')
   }
 
+  async function installApp() {
+    if (!installPrompt) return
+    installPrompt.prompt()
+    await installPrompt.userChoice
+    setInstallPrompt(null)
+  }
+
   async function auth(e: FormEvent<HTMLFormElement>) {
     if (!db) return
     e.preventDefault()
@@ -419,6 +446,26 @@ export default function Home() {
     else { setNotice('Room clock updated.'); setShowSettings(false); await loadDashboard({ ...room, day_boundary_time: boundary }) }
   }
 
+  async function leaveRoom() {
+    if (!db || !room) return
+    if (!window.confirm(`Leave "${room.name}"? You'll lose access to its history unless you're invited back.`)) return
+    const { error } = await db.rpc('leave_room', { target_room: room.id })
+    if (error) { setNotice(error.message); return }
+    setNotice('Left the room.')
+    setShowSettings(false)
+    await checkUserState()
+  }
+
+  async function deleteRoomFn() {
+    if (!db || !room) return
+    if (!window.confirm(`Delete "${room.name}" for everyone? This cannot be undone.`)) return
+    const { error } = await db.rpc('delete_room', { target_room: room.id })
+    if (error) { setNotice(error.message); return }
+    setNotice('Room deleted.')
+    setShowSettings(false)
+    await checkUserState()
+  }
+
   async function submitProofModal(e: FormEvent<HTMLFormElement>) {
     if (!db || !room || !user || !proofModalTask) return
     e.preventDefault()
@@ -426,25 +473,48 @@ export default function Home() {
     const file = proofFile
     if (!text && !file) { setNotice('Add a link, a note, or a photo.'); return }
 
-    const existing = myProofs.find(p => p.task_id === proofModalTask.id)
+    const task = proofModalTask
+    const existing = myProofs.find(p => p.task_id === task.id)
     const proofId = existing?.id || crypto.randomUUID()
     let kind: 'image' | 'link' | 'note'
     let link: string | null = null, note: string | null = null, filePath: string | null = null
-    if (file) { kind = 'image'; filePath = `${proofId}/${file.name.replace(/[^a-zA-Z0-9_.-]/g, '_')}` }
+    if (file) { kind = 'image'; filePath = `${user.id}/${crypto.randomUUID()}-${file.name.replace(/[^a-zA-Z0-9_.-]/g, '_')}` }
     else if (/^https?:\/\//.test(text)) { kind = 'link'; link = text }
     else { kind = 'note'; note = text }
 
-    const payload = { kind, link, note, file_path: filePath, status: 'submitted' as const, reviewed_by: null, reviewed_at: null, rejection_reason: null }
-    const { error } = existing
-      ? await db.from('proofs').update(payload).eq('id', proofId)
-      : await db.from('proofs').insert({ id: proofId, room_id: room.id, task_id: proofModalTask.id, user_id: user.id, task_date: cycleDate, ...payload })
-    if (error) { setNotice(error.message); return }
+    try {
+      // Upload first — the file is in storage before anything else can reference it, so a
+      // partner's realtime reload never asks for a signed URL that isn't ready yet.
+      if (file) {
+        const { error: upErr } = await db.storage.from('proof-images').upload(filePath!, file)
+        if (upErr) { setNotice(upErr.message); return }
+      }
 
-    if (file) {
-      const { error: upErr } = await db.storage.from('proof-images').upload(filePath!, file, { upsert: true })
-      if (upErr) { setNotice(upErr.message); return }
+      const payload = { kind, link, note, file_path: filePath, status: 'submitted' as const, reviewed_by: null, reviewed_at: null, rejection_reason: null }
+      const { error } = existing
+        ? await db.from('proofs').update(payload).eq('id', proofId)
+        : await db.from('proofs').insert({ id: proofId, room_id: room.id, task_id: task.id, user_id: user.id, task_date: cycleDate, ...payload })
+      if (error) {
+        if (filePath) await db.storage.from('proof-images').remove([filePath])
+        setNotice(error.message)
+        return
+      }
+
+      // Update local state immediately rather than waiting on a reload — the task flips to
+      // "Waiting for partner" right away instead of sitting on "Submit proof" until whatever
+      // background reload happens to land.
+      setProofs(prev => [
+        ...prev.filter(p => p.id !== proofId),
+        { id: proofId, task_id: task.id, user_id: user.id, status: 'submitted', kind, note, link, file_path: filePath,
+          profiles: { display_name: myName }, daily_tasks: { platform: task.platform, points: task.points } },
+      ])
+      setNotice('Proof sent.')
+      setProofModalTask(null)
+      setProofFile(null)
+      await loadDashboard(room)
+    } catch (err: any) {
+      setNotice(err?.message || 'Something went wrong sending that proof — try again.')
     }
-    setNotice('Proof sent.'); setProofModalTask(null); setProofFile(null); await loadDashboard(room)
   }
 
   async function approveProof(proof: Proof) {
@@ -515,6 +585,7 @@ export default function Home() {
   const last7 = dayStates.slice(-7)
   const calendarDays = Array.from({ length: HISTORY_DAYS }, (_, i) => daysAgoDate(HISTORY_DAYS - 1 - i))
   const roomFull = members.length >= 2
+  const isIOS = typeof navigator !== 'undefined' && /iphone|ipad|ipod/i.test(navigator.userAgent)
 
   return (
     <main className="dashboardV2">
@@ -588,19 +659,29 @@ export default function Home() {
               <strong>{time}</strong>
               <span>Resets at {room ? formatBoundary(room.day_boundary_time) : ''} ({room?.timezone}). Submit your proof before then.</span>
               <div className="countCardActions">
-                {isOwner && <button className="tinyLink" type="button" onClick={() => setShowSettings(s => !s)}>Adjust clock</button>}
+                <button className="tinyLink" type="button" onClick={() => setShowSettings(s => !s)}>Room settings</button>
                 {notifPermission !== 'unsupported' && notifPermission !== 'granted' && <button className="tinyLink" type="button" onClick={enableReminders}>🔔 Get reminders</button>}
                 {notifPermission === 'granted' && <span className="tinyLink" style={{ cursor: 'default' }}>🔔 Reminders on</span>}
+                {installPrompt && !isStandalone && <button className="tinyLink" type="button" onClick={installApp}>⬇ Download app</button>}
+                {!installPrompt && !isStandalone && isIOS && <span className="tinyLink" style={{ cursor: 'default' }}>⬇ Add to Home Screen via the Share menu</span>}
               </div>
             </section>
 
             {showSettings && room && (
-              <form className="card settingsInline" onSubmit={saveRoomSettings}>
-                <label>When does your day reset?</label>
-                <select name="boundary" defaultValue={room.day_boundary_time.slice(0, 5)}>{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select>
-                <button>Save</button>
-                <button className="link" type="button" onClick={() => setShowSettings(false)}>Cancel</button>
-              </form>
+              <div className="card settingsInline">
+                {isOwner && (
+                  <form onSubmit={saveRoomSettings}>
+                    <label>When does your day reset?</label>
+                    <select name="boundary" defaultValue={room.day_boundary_time.slice(0, 5)}>{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select>
+                    <button>Save</button>
+                  </form>
+                )}
+                <div className="inlineActions">
+                  <button className="link" type="button" onClick={() => setShowSettings(false)}>Cancel</button>
+                  <button className="dangerBtn" type="button" onClick={leaveRoom}>Leave room</button>
+                  {isOwner && <button className="dangerBtn" type="button" onClick={deleteRoomFn}>Delete room</button>}
+                </div>
+              </div>
             )}
 
             <section className="progress">
