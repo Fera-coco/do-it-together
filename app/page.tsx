@@ -15,18 +15,23 @@ type Proof = {
   note: string | null
   link: string | null
   file_path: string | null
+  created_at?: string
   profiles: { display_name: string } | null
   daily_tasks: { platform: string; points: number } | null
 }
 type DayState = { cycle_date: string; combined_points: number; grade: string }
 type WeekState = { user_id: string; rest_credits_remaining: number; rest_days: number[] | null }
 type ChatMessage = { id: string; user_id: string; body: string; created_at: string }
+type HistTask = { id: string; user_id: string; cycle_date: string; platform: string }
 type Mode = 'auth' | 'platforms' | 'profile' | 'setup' | 'join' | 'room'
+type DashTab = 'today' | 'calendar' | 'feed' | 'progress'
 
 const PLATFORM_OPTIONS = ['Instagram', 'TikTok', 'YouTube', 'X (Twitter)', 'LinkedIn', 'Threads', 'Facebook', 'Pinterest', 'Snapchat', 'Other']
 const WEEKDAYS = [{ v: 0, l: 'Sun' }, { v: 1, l: 'Mon' }, { v: 2, l: 'Tue' }, { v: 3, l: 'Wed' }, { v: 4, l: 'Thu' }, { v: 5, l: 'Fri' }, { v: 6, l: 'Sat' }]
 const BOUNDARY_PRESETS = [{ v: '00:00', l: 'Midnight → Midnight' }, { v: '06:00', l: '6am → 6am' }, { v: '12:00', l: 'Noon → Noon' }, { v: '18:00', l: '6pm → 6pm' }]
+const AVATAR_COLORS = ['#e2a23f', '#e28aa5', '#8f7fd6', '#6fb98f', '#e2946b', '#7fa8d6']
 const ACTIVE_ROOM_KEY = 'dit_active_room'
+const HISTORY_DAYS = 35
 
 function gradeLabel(points: number) {
   if (points >= 100) return 'Lovely'
@@ -41,6 +46,11 @@ function mondayOf(dateStr: string) {
   d.setDate(d.getDate() - ((d.getDay() + 6) % 7))
   return d.toISOString().slice(0, 10)
 }
+function daysAgoDate(n: number) {
+  const d = new Date()
+  d.setDate(d.getDate() - n)
+  return d.toISOString().slice(0, 10)
+}
 function formatBoundary(t: string) {
   const [h, m] = t.split(':').map(Number)
   const h12 = ((h + 11) % 12) + 1
@@ -48,6 +58,9 @@ function formatBoundary(t: string) {
 }
 function formatShortDate(d: string) {
   return new Date(d + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
+}
+function formatFullDate(d: string) {
+  return new Date(d + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }).toUpperCase()
 }
 function formatTime(d: string) {
   return new Date(d).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
@@ -64,6 +77,31 @@ function readStoredRoomId() {
 }
 function storeRoomId(id: string) {
   try { localStorage.setItem(ACTIVE_ROOM_KEY, id) } catch { /* private browsing etc — fine to skip */ }
+}
+function avatarColor(id: string) {
+  let h = 0
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0
+  return AVATAR_COLORS[h % AVATAR_COLORS.length]
+}
+// A day counts toward a streak if every real (non-rest) task that day was approved, or if it
+// was an excused rest day. Walking the sorted date list once gives the best-ever run; walking
+// backward from the most recent date gives the current run.
+function computeStreaks(histTasks: HistTask[], approvedIds: Set<string>, memberIds: string[]) {
+  const byUserDate: Record<string, Record<string, HistTask[]>> = {}
+  for (const t of histTasks) {
+    (byUserDate[t.user_id] ??= {})[t.cycle_date] ??= []
+    byUserDate[t.user_id][t.cycle_date].push(t)
+  }
+  const dayDone = (dayTasks: HistTask[]) => dayTasks.some(t => t.platform === '__rest__') || dayTasks.every(t => approvedIds.has(t.id))
+  const result: Record<string, { current: number; best: number }> = {}
+  for (const uid of memberIds) {
+    const dates = Object.keys(byUserDate[uid] || {}).sort()
+    let best = 0, run = 0, current = 0
+    for (const d of dates) { if (dayDone(byUserDate[uid][d])) { run++; if (run > best) best = run } else run = 0 }
+    for (let i = dates.length - 1; i >= 0; i--) { if (dayDone(byUserDate[uid][dates[i]])) current++; else break }
+    result[uid] = { current, best }
+  }
+  return result
 }
 
 function WeekdayPicker({ selected, onToggle }: { selected: number[]; onToggle: (d: number) => void }) {
@@ -86,9 +124,12 @@ export default function Home() {
   const [tasks, setTasks] = useState<DailyTask[]>([])
   const [partnerTasks, setPartnerTasks] = useState<DailyTask[]>([])
   const [proofs, setProofs] = useState<Proof[]>([])
+  const [feedProofs, setFeedProofs] = useState<Proof[]>([])
   const [signedUrls, setSignedUrls] = useState<Record<string, string>>({})
   const [dayStates, setDayStates] = useState<DayState[]>([])
   const [weekStates, setWeekStates] = useState<WeekState[]>([])
+  const [histTasks, setHistTasks] = useState<HistTask[]>([])
+  const [approvedTaskIds, setApprovedTaskIds] = useState<Set<string>>(new Set())
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [chatText, setChatText] = useState('')
   const [cycleDate, setCycleDate] = useState('')
@@ -96,6 +137,7 @@ export default function Home() {
   const [inviteCode, setInviteCode] = useState('')
   const [notice, setNotice] = useState('')
   const [mode, setMode] = useState<Mode>('auth')
+  const [dashTab, setDashTab] = useState<DashTab>('today')
   const [cameFromRoom, setCameFromRoom] = useState(false)
   const [authView, setAuthView] = useState<'signup' | 'signin'>('signup')
   const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>([])
@@ -159,6 +201,7 @@ export default function Home() {
 
   async function switchRoom(r: RoomSummary) {
     storeRoomId(r.id)
+    setDashTab('today')
     await loadDashboard(r)
   }
 
@@ -187,12 +230,19 @@ export default function Home() {
     setIsOwner(amOwner)
 
     const weekStart = mondayOf(cdate)
-    const [{ data: allTasks }, { data: proofRows }, { data: dayRows }, { data: weekRows }, { data: chatRows }, inviteResult] = await Promise.all([
+    const since = daysAgoDate(HISTORY_DAYS - 1)
+    const [
+      { data: allTasks }, { data: proofRows }, { data: dayRows }, { data: weekRows }, { data: chatRows },
+      { data: histTaskRows }, { data: approvedRows }, { data: feedRows }, inviteResult,
+    ] = await Promise.all([
       db.from('daily_tasks').select('id,user_id,platform,points').eq('room_id', roomRow.id).eq('cycle_date', cdate).neq('platform', '__rest__'),
       db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,profiles(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).eq('task_date', cdate),
-      db.from('room_day_state').select('cycle_date,combined_points,grade').eq('room_id', roomRow.id).order('cycle_date', { ascending: false }).limit(7),
+      db.from('room_day_state').select('cycle_date,combined_points,grade').eq('room_id', roomRow.id).order('cycle_date', { ascending: false }).limit(HISTORY_DAYS),
       db.from('member_week_state').select('user_id,rest_credits_remaining,rest_days').eq('room_id', roomRow.id).eq('week_start', weekStart),
       db.from('room_messages').select('id,user_id,body,created_at').eq('room_id', roomRow.id).order('created_at', { ascending: true }).limit(100),
+      db.from('daily_tasks').select('id,user_id,cycle_date,platform').eq('room_id', roomRow.id).gte('cycle_date', since),
+      db.from('proofs').select('task_id').eq('room_id', roomRow.id).eq('status', 'approved').gte('task_date', since),
+      db.from('proofs').select('id,task_id,user_id,status,kind,note,link,file_path,created_at,profiles(display_name),daily_tasks(platform,points)').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(30),
       amOwner
         ? db.from('room_invites').select('code,uses,max_uses').eq('room_id', roomRow.id).order('created_at', { ascending: false }).limit(1).maybeSingle()
         : Promise.resolve({ data: null as any }),
@@ -204,12 +254,16 @@ export default function Home() {
     const weekList: WeekState[] = (weekRows as any) || []
     setWeekStates(weekList)
     setMessages((chatRows as any) || [])
+    setHistTasks((histTaskRows as any) || [])
+    setApprovedTaskIds(new Set(((approvedRows as any) || []).map((r: any) => r.task_id)))
+    const feedList: Proof[] = (feedRows as any) || []
+    setFeedProofs(feedList)
     setInviteCode(inviteResult.data && inviteResult.data.uses < inviteResult.data.max_uses ? inviteResult.data.code : '')
 
     const myWeek = weekList.find(w => w.user_id === myId)
     setWeekPickerDays(myWeek?.rest_days || me?.rest_days || [])
 
-    ensureSignedUrls(proofList)
+    ensureSignedUrls([...proofList, ...feedList])
     setMode('room')
   }
 
@@ -368,6 +422,14 @@ export default function Home() {
     return members.find(m => m.user_id === userId)?.profiles?.display_name || 'Member'
   }
 
+  function statusFor(uid: string) {
+    if (uid === user?.id && isRestDay) return 'Resting today'
+    const memberTasks = uid === user?.id ? tasks : partnerTasks.filter(t => t.user_id === uid)
+    if (memberTasks.length === 0) return 'Not started'
+    const done = memberTasks.filter(t => proofs.find(p => p.task_id === t.id)?.status === 'approved').length
+    return done === memberTasks.length ? 'Done for today' : `${done} of ${memberTasks.length} done`
+  }
+
   if (!db) return <main className="welcome"><div><p className="eyebrow">DO IT TOGETHER</p><h1>Almost<br/><i>ready.</i></h1><p>Add the Supabase public URL and publishable key in <code>.env.local</code> to start your private room.</p></div></main>
 
   if (mode === 'auth') return <main className="welcome"><div><p className="eyebrow">DO IT TOGETHER</p><h1>Show up.<br/><i>Together.</i></h1><p>Build your own social rhythm, then invite a friend whenever you want accountability.</p></div><form className="card" onSubmit={auth}><h2>{authView === 'signup' ? 'Create your profile' : 'Welcome back'}</h2>{authView === 'signup' && <input required name="name" placeholder="Your name" />}<input required name="email" type="email" placeholder="Email" /><input required name="password" type="password" placeholder="Password" minLength={6} /><button>{authView === 'signup' ? 'Create profile →' : 'Sign in →'}</button><button className="link" type="button" onClick={() => { setAuthView(authView === 'signup' ? 'signin' : 'signup'); setNotice('') }}>{authView === 'signup' ? 'I already have an account' : 'Create a new account'}</button>{notice && <small>{notice}</small>}</form></main>
@@ -381,6 +443,7 @@ export default function Home() {
   if (mode === 'setup') return <main className="welcome"><form className="card setup" onSubmit={createRoom}><p className="eyebrow">CREATE A ROOM</p><h1>Choose your<br/><i>daily rhythm.</i></h1><input required name="room" placeholder="Room name — e.g. The Posting Pact" /><label>When does your day reset?</label><select name="boundary" defaultValue="00:00">{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select><label>Your rest days (pick up to 2)</label><WeekdayPicker selected={setupRestDays} onToggle={toggleSetupRestDay} /><button>Create room →</button><button className="link" type="button" onClick={() => setMode(myRooms.length ? 'room' : 'profile')}>Back</button>{notice && <small>{notice}</small>}</form></main>
 
   const myId = user?.id
+  const myName = members.find(m => m.user_id === myId)?.profiles?.display_name || 'You'
   const myProofs = proofs.filter(p => p.user_id === myId)
   const pendingReview = proofs.filter(p => p.user_id !== myId && p.status === 'submitted')
   const confirmed = proofs.filter(p => p.status === 'approved').reduce((n, p) => n + (p.daily_tasks?.points || 0), 0)
@@ -389,195 +452,280 @@ export default function Home() {
   const time = `${String(Math.floor(seconds / 3600)).padStart(2, '0')}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
   const myWeekState = weekStates.find(w => w.user_id === myId)
   const needsWeekPick = myWeekState?.rest_days == null
-  const partnerIds = Array.from(new Set(partnerTasks.map(t => t.user_id)))
+  const myDone = tasks.filter(t => myProofs.find(p => p.task_id === t.id)?.status === 'approved').length
+  const streaks = computeStreaks(histTasks, approvedTaskIds, members.map(m => m.user_id))
+  const myStreak = streaks[myId || ''] || { current: 0, best: 0 }
+  const last7 = dayStates.slice(-7)
+  const calendarDays = Array.from({ length: HISTORY_DAYS }, (_, i) => daysAgoDate(HISTORY_DAYS - 1 - i))
 
   return (
-    <main className="dashboard">
-      <header>
-        <b>↗ <span>do it<br/>together</span></b>
-        <div className="roomSwitcher">
-          {myRooms.map(r => (
-            <button key={r.id} className={r.id === room?.id ? 'active' : ''} onClick={() => switchRoom(r)}>{r.name}</button>
-          ))}
-          <button className="addRoom" onClick={() => { setCameFromRoom(true); setMode('profile') }} title="Add another room">+</button>
+    <main className="dashboardV2">
+      <aside className="sidebar">
+        <b className="brand">↗ <span>do it<br />together</span></b>
+        <nav>
+          <button className={dashTab === 'today' ? 'active' : ''} onClick={() => setDashTab('today')}>◉ Today</button>
+          <button className={dashTab === 'calendar' ? 'active' : ''} onClick={() => setDashTab('calendar')}>▦ Calendar</button>
+          <button className={dashTab === 'feed' ? 'active' : ''} onClick={() => setDashTab('feed')}>◌ Group feed</button>
+          <button className={dashTab === 'progress' ? 'active' : ''} onClick={() => setDashTab('progress')}>↗ Your progress</button>
+        </nav>
+        <div className="sidebarRooms">
+          {myRooms.map(r => <button key={r.id} className={r.id === room?.id ? 'active' : ''} onClick={() => switchRoom(r)}>{r.name}</button>)}
+          <button className="addRoom" onClick={() => { setCameFromRoom(true); setMode('profile') }}>+ Add room</button>
         </div>
-        <button className="link" onClick={() => db.auth.signOut()}>Sign out</button>
-      </header>
+        <button className="link sidebarSignout" onClick={() => db.auth.signOut()}>Sign out</button>
+      </aside>
 
-      {needsWeekPick && (
-        <section className="progress restBanner">
-          <b>Pick your rest days for this week</b>
-          <span>Choose up to 2 — until you pick, no day is excused this week.</span>
-          <WeekdayPicker selected={weekPickerDays} onToggle={toggleWeekPickerDay} />
-          <div className="inlineActions">
-            <button onClick={() => saveWeekRestDays(false)}>Save rest days</button>
-            <button className="link" type="button" onClick={() => saveWeekRestDays(true)}>No rest days this week</button>
-          </div>
-        </section>
-      )}
-
-      {isRestDay && (
-        <section className="progress restBanner">
-          <b>🌿 Today's your rest day</b>
-          <span>No tasks assigned for you today. {typeof myWeekState?.rest_credits_remaining === 'number' ? `${myWeekState.rest_credits_remaining} rest credit${myWeekState.rest_credits_remaining === 1 ? '' : 's'} left this week.` : ''}</span>
-        </section>
-      )}
-
-      <section className="hero">
-        <div>
-          <p className="eyebrow">TODAY'S COMBINED TARGET</p>
-          <h1>{target} points<br/><i>{gradeLabel(confirmed).toLowerCase()}.</i></h1>
-          <p>The room needs at least 50 combined before the cycle resets, or today's points are at risk — and whoever didn't post loses a rest day.</p>
+      <section className="mainPane">
+        <div className="dateRow">
+          <span className="dateLabel">{cycleDate ? formatFullDate(cycleDate) : ''}</span>
+          <span className="avatar" style={{ background: avatarColor(myId || '') }}>{myName[0]?.toUpperCase()}</span>
         </div>
-        <div className="count">
-          <small>TIME LEFT</small>
-          <strong>{time}</strong>
-          <span>Resets at {room ? formatBoundary(room.day_boundary_time) : ''} ({room?.timezone}).</span>
-          {isOwner && <button className="tinyLink" type="button" onClick={() => setShowSettings(s => !s)}>Adjust clock</button>}
-        </div>
-      </section>
 
-      {showSettings && room && (
-        <form className="card settingsInline" onSubmit={saveRoomSettings}>
-          <label>When does your day reset?</label>
-          <select name="boundary" defaultValue={room.day_boundary_time.slice(0, 5)}>{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select>
-          <button>Save</button>
-          <button className="link" type="button" onClick={() => setShowSettings(false)}>Cancel</button>
-        </form>
-      )}
-
-      <section className="progress">
-        <b>{confirmed}/{target} confirmed points · {gradeLabel(confirmed)}</b>
-        <span>{confirmed >= 50 ? 'Floor cleared — keep going for a better grade.' : 'No points count until your partner approves proof.'}</span>
-      </section>
-
-      {pendingReview.length > 0 && (
-        <section className="reviewSection">
-          <h2>Confirm your partner's proof</h2>
-          {pendingReview.map(p => (
-            <div className="reviewCard" key={p.id}>
-              <div>
-                <b>{p.profiles?.display_name || 'Your partner'} · {p.daily_tasks?.platform}</b>
-                <small>
-                  {p.kind === 'image' ? (signedUrls[p.id] ? <a href={signedUrls[p.id]} target="_blank" rel="noreferrer">View photo →</a> : 'Loading photo…')
-                    : p.kind === 'link' ? p.link : p.note} · {p.daily_tasks?.points} points
-                </small>
-              </div>
-              {rejectingProof?.id === p.id ? (
-                <form className="rejectForm" onSubmit={confirmReject}>
-                  <input name="reason" placeholder="Why? (optional)" autoFocus />
-                  <button>Confirm reject</button>
-                  <button className="link" type="button" onClick={() => setRejectingProof(null)}>Cancel</button>
-                </form>
-              ) : (
-                <>
-                  <button onClick={() => approveProof(p)}>Confirm</button>
-                  <button className="reject" onClick={() => setRejectingProof(p)}>Reject</button>
-                </>
-              )}
+        {needsWeekPick && (
+          <section className="progress restBanner">
+            <b>Pick your rest days for this week</b>
+            <span>Choose up to 2 — until you pick, no day is excused this week.</span>
+            <WeekdayPicker selected={weekPickerDays} onToggle={toggleWeekPickerDay} />
+            <div className="inlineActions">
+              <button onClick={() => saveWeekRestDays(false)}>Save rest days</button>
+              <button className="link" type="button" onClick={() => saveWeekRestDays(true)}>No rest days this week</button>
             </div>
-          ))}
-        </section>
-      )}
+          </section>
+        )}
 
-      {!isRestDay && (
-        <section>
-          <p className="eyebrow">YOUR DAILY REPS</p>
-          <h2>What are you showing up for?</h2>
-          {tasks.map(task => {
-            const proof = myProofs.find(p => p.task_id === task.id)
-            return (
-              <article className="task" key={task.id}>
-                <div><b>{task.platform}</b><small>Post on {task.platform} today</small><em>{task.points} points</em></div>
-                {proof
-                  ? <span className={`proof ${proof.status}`}>{proof.status === 'approved' ? 'Confirmed ✓' : proof.status === 'rejected' ? 'Rejected — resubmit' : 'Waiting for partner'}</span>
-                  : <button onClick={() => setProofModalTask(task)}>Submit proof →</button>}
-              </article>
-            )
-          })}
-        </section>
-      )}
+        {isRestDay && (
+          <section className="progress restBanner">
+            <b>🌿 Today's your rest day</b>
+            <span>No tasks assigned for you today. {typeof myWeekState?.rest_credits_remaining === 'number' ? `${myWeekState.rest_credits_remaining} rest credit${myWeekState.rest_credits_remaining === 1 ? '' : 's'} left this week.` : ''}</span>
+          </section>
+        )}
 
-      {members.length > 1 && (
-        <section>
-          <p className="eyebrow">MONITORING</p>
-          <h2>Your partner's reps today</h2>
-          {partnerIds.length === 0 && <p className="dim">Your partner hasn't checked in yet today.</p>}
-          {partnerIds.map(pid => (
-            <div key={pid}>
-              {partnerTasks.filter(t => t.user_id === pid).map(task => {
-                const proof = proofs.find(p => p.task_id === task.id)
+        {dashTab === 'today' && (
+          <>
+            <section className="hero heroV2">
+              <p className="eyebrow">{room?.name}</p>
+              <h1>Show up for<br /><i>yourself.</i></h1>
+              <p>The room needs at least 50 combined before the cycle resets, or today's points are at risk.</p>
+            </section>
+
+            <section className="statRow">
+              <div className="progressRing" style={{ ['--pct' as any]: tasks.length ? `${Math.round((myDone / tasks.length) * 100)}%` : '0%' }}>
+                <span>{myDone}/{tasks.length}</span>
+              </div>
+              <div className="statText">
+                <b>{tasks.length > 0 && myDone === tasks.length ? "All done. You're moving." : `${myDone} thing${myDone === 1 ? '' : 's'} done. You're moving.`}</b>
+                <span>Complete today's social reps to keep your streak alive.</span>
+              </div>
+              <div className="streakBadge">
+                <strong>{myStreak.current} day streak</strong>
+                <small>Personal best: {myStreak.best}</small>
+              </div>
+            </section>
+
+            <section className="countCard card">
+              <small>TODAY CLOSES IN</small>
+              <strong>{time}</strong>
+              <span>Resets at {room ? formatBoundary(room.day_boundary_time) : ''} ({room?.timezone}). Submit your proof before then.</span>
+              {isOwner && <button className="tinyLink" type="button" onClick={() => setShowSettings(s => !s)}>Adjust clock</button>}
+            </section>
+
+            {showSettings && room && (
+              <form className="card settingsInline" onSubmit={saveRoomSettings}>
+                <label>When does your day reset?</label>
+                <select name="boundary" defaultValue={room.day_boundary_time.slice(0, 5)}>{BOUNDARY_PRESETS.map(b => <option key={b.v} value={b.v}>{b.l}</option>)}</select>
+                <button>Save</button>
+                <button className="link" type="button" onClick={() => setShowSettings(false)}>Cancel</button>
+              </form>
+            )}
+
+            <section className="progress">
+              <b>{confirmed}/{target} confirmed points · {gradeLabel(confirmed)}</b>
+              <span>{confirmed >= 50 ? 'Floor cleared — keep going for a better grade.' : 'No points count until your partner approves proof.'}</span>
+            </section>
+
+            {pendingReview.length > 0 && (
+              <section className="reviewSection">
+                <h2>Confirm your partner's proof</h2>
+                {pendingReview.map(p => (
+                  <div className="reviewCard" key={p.id}>
+                    <div>
+                      <b>{p.profiles?.display_name || 'Your partner'} · {p.daily_tasks?.platform}</b>
+                      <small>
+                        {p.kind === 'image' ? (signedUrls[p.id] ? <a href={signedUrls[p.id]} target="_blank" rel="noreferrer">View photo →</a> : 'Loading photo…')
+                          : p.kind === 'link' ? p.link : p.note} · {p.daily_tasks?.points} points
+                      </small>
+                    </div>
+                    {rejectingProof?.id === p.id ? (
+                      <form className="rejectForm" onSubmit={confirmReject}>
+                        <input name="reason" placeholder="Why? (optional)" autoFocus />
+                        <button>Confirm reject</button>
+                        <button className="link" type="button" onClick={() => setRejectingProof(null)}>Cancel</button>
+                      </form>
+                    ) : (
+                      <>
+                        <button onClick={() => approveProof(p)}>Confirm</button>
+                        <button className="reject" onClick={() => setRejectingProof(p)}>Reject</button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </section>
+            )}
+
+            {!isRestDay && (
+              <section>
+                <p className="eyebrow">YOUR SOCIAL REPS</p>
+                <h2>Today's list</h2>
+                {tasks.map(task => {
+                  const proof = myProofs.find(p => p.task_id === task.id)
+                  return (
+                    <article className="task taskV2" key={task.id}>
+                      <span className={`checkDot ${proof?.status === 'approved' ? 'done' : ''}`}>{proof?.status === 'approved' ? '✓' : ''}</span>
+                      <div><b>{task.platform}</b><small>Post on {task.platform} today · {task.points} points</small></div>
+                      {proof
+                        ? <span className={`proof ${proof.status}`}>{proof.status === 'approved' ? 'Confirmed ✓' : proof.status === 'rejected' ? 'Rejected — resubmit' : 'Waiting for partner'}</span>
+                        : <button onClick={() => setProofModalTask(task)}>Submit proof →</button>}
+                    </article>
+                  )
+                })}
+              </section>
+            )}
+
+            {isOwner && (
+              <section className="invitePanel">
+                <small>INVITE A PARTNER</small>
+                {inviteCode ? (
+                  <>
+                    <strong>{inviteCode}</strong>
+                    <p>Share this code — they create their own profile, pick their platforms, then choose "Join a friend."</p>
+                  </>
+                ) : (
+                  <>
+                    <p>No active invite code yet.</p>
+                    <button onClick={generateInvite}>Generate invite code →</button>
+                  </>
+                )}
+              </section>
+            )}
+          </>
+        )}
+
+        {dashTab === 'calendar' && (
+          <section>
+            <div className="calendarIntro"><p className="eyebrow">CALENDAR</p><h2>Last 5 weeks</h2></div>
+            <div className="calendarGrid">
+              {calendarDays.map(d => {
+                const state = dayStates.find(ds => ds.cycle_date === d)
+                const cls = d === cycleDate ? 'pending' : (state ? (state.combined_points >= 50 ? 'done' : 'missed') : 'missed')
                 return (
-                  <article className="task" key={task.id}>
-                    <div><b>{nameFor(pid)} · {task.platform}</b><small>{proof ? (proof.kind === 'image' ? 'Photo submitted' : proof.kind === 'link' ? proof.link : proof.note) : 'Not submitted yet'}</small><em>{task.points} points</em></div>
-                    {proof ? <span className={`proof ${proof.status}`}>{proof.status === 'approved' ? 'Confirmed ✓' : proof.status === 'rejected' ? 'Rejected' : 'Awaiting your review'}</span> : <span className="proof">Waiting</span>}
-                  </article>
+                  <div key={d} className={`calendarDay ${cls}`}>
+                    <small>{new Date(d + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' })}</small>
+                    <b>{new Date(d + 'T00:00:00').getDate()}</b>
+                  </div>
                 )
               })}
             </div>
+            <div className="legend"><span><i className="done"></i>Done</span><span><i className="pending"></i>Today</span><span><i className="missed"></i>Missed</span></div>
+          </section>
+        )}
+
+        {dashTab === 'feed' && (
+          <>
+            <section>
+              <p className="eyebrow">FROM THE GROUP</p>
+              <h2>Recent proof</h2>
+              {feedProofs.length === 0 && <p className="dim">Nothing submitted yet.</p>}
+              {feedProofs.map(p => (
+                <article className="feedItem" key={p.id}>
+                  <span className="avatar" style={{ background: avatarColor(p.user_id) }}>{(p.profiles?.display_name || nameFor(p.user_id))[0]?.toUpperCase()}</span>
+                  <div>
+                    <b>{p.profiles?.display_name || nameFor(p.user_id)} · {p.daily_tasks?.platform}</b>
+                    <small>
+                      {p.kind === 'image' ? (signedUrls[p.id] ? <a href={signedUrls[p.id]} target="_blank" rel="noreferrer">View photo →</a> : 'Loading photo…') : p.kind === 'link' ? p.link : p.note}
+                    </small>
+                    <span className={`proof ${p.status}`}>{p.status === 'approved' ? 'Confirmed ✓' : p.status === 'rejected' ? 'Rejected' : 'Awaiting review'}</span>
+                  </div>
+                </article>
+              ))}
+            </section>
+
+            {members.length > 1 && (
+              <section className="chatSection">
+                <p className="eyebrow">ROOM CHAT</p>
+                <h2>Check in with your partner</h2>
+                <div className="chatLog">
+                  {messages.length === 0 && <p className="dim">No messages yet — say hi.</p>}
+                  {messages.map(m => (
+                    <div key={m.id} className={`chatBubble ${m.user_id === myId ? 'mine' : ''}`}>
+                      <small>{nameFor(m.user_id)} · {formatTime(m.created_at)}</small>
+                      <p>{m.body}</p>
+                    </div>
+                  ))}
+                  <div ref={chatEndRef} />
+                </div>
+                <form className="chatForm" onSubmit={sendMessage}>
+                  <input value={chatText} onChange={e => setChatText(e.target.value)} placeholder="Message your partner…" maxLength={500} />
+                  <button>Send</button>
+                </form>
+              </section>
+            )}
+          </>
+        )}
+
+        {dashTab === 'progress' && (
+          <section>
+            <p className="eyebrow">YOUR PROGRESS</p>
+            <h2>{myStreak.current} day streak</h2>
+            <p className="dim">Personal best: {myStreak.best} days</p>
+
+            {last7.length > 0 && (
+              <div className="weekSection">
+                <p className="eyebrow">THIS WEEK</p>
+                <div className="weekGrid">
+                  {last7.map(d => (
+                    <div key={d.cycle_date} className="weekDay">
+                      <small>{formatShortDate(d.cycle_date)}</small>
+                      <b>{d.combined_points}</b>
+                      <span>{d.grade}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="restCredits">
+                  {members.map(m => {
+                    const w = weekStates.find(ws => ws.user_id === m.user_id)
+                    return <span key={m.user_id}>{m.profiles?.display_name || 'Member'}: {typeof w?.rest_credits_remaining === 'number' ? w.rest_credits_remaining : 2} rest credit(s) left</span>
+                  })}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+      </section>
+
+      <aside className="rightRail">
+        <div className="peoplePanel card">
+          <div className="peoplePanelHead"><p className="eyebrow">YOUR PEOPLE</p><h2>{room?.name}</h2></div>
+          {members.map(m => (
+            <div className="personRow" key={m.user_id}>
+              <span className="avatar" style={{ background: avatarColor(m.user_id) }}>{(m.profiles?.display_name || 'M')[0]?.toUpperCase()}</span>
+              <div><b>{m.profiles?.display_name || 'Member'}{m.user_id === myId ? ' (you)' : ''}</b><small>{statusFor(m.user_id)}</small></div>
+              <span className="streakNum">{streaks[m.user_id]?.current ?? 0}<small>days</small></span>
+            </div>
           ))}
-        </section>
-      )}
+          {isOwner && <button className="inviteRow" type="button" onClick={() => setDashTab('today')}>+ Invite a friend</button>}
+        </div>
 
-      {dayStates.length > 0 && (
-        <section className="weekSection">
-          <p className="eyebrow">THIS WEEK</p>
-          <h2>How the room's doing</h2>
-          <div className="weekGrid">
-            {dayStates.map(d => (
-              <div key={d.cycle_date} className="weekDay">
-                <small>{formatShortDate(d.cycle_date)}</small>
-                <b>{d.combined_points}</b>
-                <span>{d.grade}</span>
-              </div>
-            ))}
-          </div>
-          <div className="restCredits">
-            {members.map(m => {
-              const w = weekStates.find(ws => ws.user_id === m.user_id)
-              return <span key={m.user_id}>{m.profiles?.display_name || 'Member'}: {typeof w?.rest_credits_remaining === 'number' ? w.rest_credits_remaining : 2} rest credit(s) left</span>
-            })}
-          </div>
-        </section>
-      )}
-
-      {members.length > 1 && (
-        <section className="chatSection">
-          <p className="eyebrow">ROOM CHAT</p>
-          <h2>Check in with your partner</h2>
-          <div className="chatLog">
-            {messages.length === 0 && <p className="dim">No messages yet — say hi.</p>}
-            {messages.map(m => (
-              <div key={m.id} className={`chatBubble ${m.user_id === myId ? 'mine' : ''}`}>
-                <small>{nameFor(m.user_id)} · {formatTime(m.created_at)}</small>
-                <p>{m.body}</p>
-              </div>
-            ))}
-            <div ref={chatEndRef} />
-          </div>
-          <form className="chatForm" onSubmit={sendMessage}>
-            <input value={chatText} onChange={e => setChatText(e.target.value)} placeholder="Message your partner…" maxLength={500} />
-            <button>Send</button>
-          </form>
-        </section>
-      )}
-
-      {isOwner && (
-        <section className="invitePanel">
-          <small>INVITE A PARTNER</small>
-          {inviteCode ? (
-            <>
-              <strong>{inviteCode}</strong>
-              <p>Share this code — they create their own profile, pick their platforms, then choose "Join a friend."</p>
-            </>
-          ) : (
-            <>
-              <p>No active invite code yet.</p>
-              <button onClick={generateInvite}>Generate invite code →</button>
-            </>
-          )}
-        </section>
-      )}
+        <div className="feedPanel card">
+          <div className="feedPanelHead"><p className="eyebrow">FROM THE GROUP</p><h3>Recent proof</h3><button className="link tinyLink" type="button" onClick={() => setDashTab('feed')}>See all</button></div>
+          {feedProofs.slice(0, 3).map(p => (
+            <div className="feedPreviewItem" key={p.id}>
+              <span className="avatar small" style={{ background: avatarColor(p.user_id) }}>{(p.profiles?.display_name || nameFor(p.user_id))[0]?.toUpperCase()}</span>
+              <div><b>{p.profiles?.display_name || nameFor(p.user_id)}</b><small>{p.kind === 'image' ? 'posted a photo' : p.kind === 'link' ? 'shared a link' : 'left a note'} on {p.daily_tasks?.platform}</small></div>
+            </div>
+          ))}
+          {feedProofs.length === 0 && <p className="dim">Nothing yet.</p>}
+        </div>
+      </aside>
 
       {proofModalTask && (
         <div className="modalOverlay" onClick={() => { setProofModalTask(null); setProofFile(null) }}>
